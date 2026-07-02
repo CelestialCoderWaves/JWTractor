@@ -1,7 +1,8 @@
-# NFA Decompiler
+# JWTractor
 
-A tiny, transparent tool that reads the string embedded in an `.exe` and prints
-it prefixed with the file's name:
+A tiny, transparent tool that reads the JWT embedded in an `.exe` and prints
+it prefixed with the file's name — no decompiling, it just pulls out a token
+that's already stored as plain text in the file:
 
 ```
 ChadGreen----eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSJ9.eyJpc3Mi...
@@ -45,8 +46,8 @@ or executes the input, and it makes **no network connections** of any kind.
 Requires **Python 3.9+**.
 
 ```bash
-git clone https://github.com/CelestialCoderWaves/NFADecompiler.git
-cd NFADecompiler
+git clone https://github.com/CelestialCoderWaves/JWTractor.git
+cd JWTractor
 pip install -r requirements.txt
 python app.py
 ```
@@ -68,7 +69,7 @@ python extract.py ChadGreen.exe
 
 ## Building a standalone .exe (to share with friends)
 
-This produces a single `dist\NFADecompiler.exe` that needs **nothing installed**
+This produces a single `dist\JWTractor.exe` that needs **nothing installed**
 on the other machine. From this folder, in PowerShell:
 
 ```powershell
@@ -79,7 +80,7 @@ If PowerShell blocks the script, either run the underlying command directly:
 
 ```powershell
 pip install pyinstaller tkinterdnd2
-python -m PyInstaller --noconfirm --onefile --windowed --name NFADecompiler --collect-all tkinterdnd2 app.py
+python -m PyInstaller --noconfirm --onefile --windowed --name JWTractor --collect-all tkinterdnd2 app.py
 ```
 
 ...or allow the script for this one process: `powershell -ExecutionPolicy Bypass -File build.ps1`.
@@ -91,7 +92,7 @@ repository stays 100% readable source that anyone can audit.
 ### Using the built .exe (for friends — no install)
 
 - **Double-click it**, then drag an `.exe` onto the window (or click *Browse*), or
-- **Drag an `.exe` directly onto `NFADecompiler.exe`'s icon** in Explorer.
+- **Drag an `.exe` directly onto `JWTractor.exe`'s icon** in Explorer.
 
 The string appears and is copied to your clipboard automatically.
 

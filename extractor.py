@@ -1,4 +1,4 @@
-"""Core extraction logic for NFA Decompiler.
+"""Core extraction logic for JWTractor.
 
 The interesting string embedded in these EXEs is a JWT — three base64url
 segments separated by dots (``header.payload.signature``). It is stored in the

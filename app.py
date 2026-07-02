@@ -1,4 +1,4 @@
-"""NFA Decompiler - drag-and-drop GUI.
+"""JWTractor - drag-and-drop GUI.
 
 Drop an .exe onto the window (or click Browse) and it prints the embedded
 string as ``<name>----<token>``, ready to copy.
@@ -26,7 +26,7 @@ except Exception:  # pragma: no cover - depends on install
     _DND_AVAILABLE = False
 
 
-APP_TITLE = "NFA Decompiler"
+APP_TITLE = "JWTractor"
 BG = "#1e1f2b"
 BG_DROP = "#2a2c3d"
 BG_DROP_HOVER = "#34374d"

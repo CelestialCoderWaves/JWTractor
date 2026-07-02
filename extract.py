@@ -1,4 +1,4 @@
-"""Command-line front-end for NFA Decompiler.
+"""Command-line front-end for JWTractor.
 
     python extract.py ChadGreen.exe
     -> ChadGreen----eyAidHlwIjogIkpXVCIs...
