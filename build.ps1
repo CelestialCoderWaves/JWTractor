@@ -1,0 +1,28 @@
+# Builds NFADecompiler.exe - a single, self-contained Windows executable.
+# Run from this folder:   powershell -ExecutionPolicy Bypass -File build.ps1
+#
+# Output: dist\NFADecompiler.exe  (share this file with friends; nothing to install)
+
+$ErrorActionPreference = "Stop"
+
+Write-Host "Installing build dependencies..." -ForegroundColor Cyan
+python -m pip install --upgrade pip
+python -m pip install pyinstaller tkinterdnd2
+
+Write-Host "Building NFADecompiler.exe..." -ForegroundColor Cyan
+# --collect-all tkinterdnd2 bundles the native tkdnd library the package needs.
+python -m PyInstaller `
+    --noconfirm `
+    --onefile `
+    --windowed `
+    --name NFADecompiler `
+    --collect-all tkinterdnd2 `
+    app.py
+
+if (Test-Path "dist\NFADecompiler.exe") {
+    Write-Host ""
+    Write-Host "Done -> dist\NFADecompiler.exe" -ForegroundColor Green
+} else {
+    Write-Host "Build failed: dist\NFADecompiler.exe not found." -ForegroundColor Red
+    exit 1
+}
