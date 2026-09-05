@@ -13,8 +13,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from extractor import (  # noqa: E402
     ExtractionError,
+    decode_token,
     extract_from_file,
     find_tokens,
+    summarize_claims,
     username_from_path,
 )
 
@@ -74,3 +76,52 @@ def test_ignores_non_jwt_lookalikes():
 def test_dedupes_repeated_token():
     data = SAMPLE_TOKEN.encode() + b"\x00" + SAMPLE_TOKEN.encode()
     assert find_tokens(data) == [SAMPLE_TOKEN]
+
+
+def test_decode_token_returns_header_and_payload():
+    decoded = decode_token(SAMPLE_TOKEN)
+    assert decoded["header"] == {"typ": "JWT", "alg": "EdDSA"}
+    assert decoded["payload"]["iss"] == "example"
+    assert decoded["payload"]["aud"] == ["client"]
+
+
+def test_decode_token_rejects_wrong_shape():
+    try:
+        decode_token("not.a-jwt")  # only two segments
+    except ExtractionError:
+        pass
+    else:
+        raise AssertionError("expected ExtractionError")
+
+
+def test_decode_token_tolerates_non_json_payload():
+    # Header is valid JSON ("{}"), payload segment is not JSON.
+    token = "eyJhbGciOiJub25lIn0.Zm9vYmFy.sig"
+    decoded = decode_token(token)
+    assert decoded["header"] == {"alg": "none"}
+    assert decoded["payload"] is None
+
+
+def test_summarize_claims_labels_and_expiry():
+    rows = dict(summarize_claims(decode_token(SAMPLE_TOKEN)["payload"]))
+    assert rows["Issuer"] == "example"
+    assert rows["Subject"] == "0000000000000000"
+    assert rows["Audience"] == "client"  # list joined into a string
+    assert "(in " in rows["Expires"]  # exp is far in the future
+
+
+def test_summarize_claims_marks_expired():
+    rows = dict(summarize_claims({"exp": 0}))  # 1970 -> long expired
+    assert "(expired " in rows["Expires"]
+
+
+def test_summarize_claims_ignores_non_dict():
+    assert summarize_claims(None) == []
+    assert summarize_claims("nope") == []
+
+
+def test_extract_from_file_includes_decoded(tmp_path):
+    path = _fake_exe(tmp_path, "ChadGreen.exe")
+    result = extract_from_file(path)
+    assert result["header"]["alg"] == "EdDSA"
+    assert result["payload"]["iss"] == "example"

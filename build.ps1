@@ -7,15 +7,22 @@ $ErrorActionPreference = "Stop"
 
 Write-Host "Installing build dependencies..." -ForegroundColor Cyan
 python -m pip install --upgrade pip
-python -m pip install pyinstaller tkinterdnd2
+python -m pip install pyinstaller tkinterdnd2 pillow
+
+Write-Host "Generating icon.ico..." -ForegroundColor Cyan
+python make_icon.py
 
 Write-Host "Building JWTractor.exe..." -ForegroundColor Cyan
 # --collect-all tkinterdnd2 bundles the native tkdnd library the package needs.
+# --icon sets the .exe's file icon; --add-data ships icon.ico so the running
+# window can use it for its title-bar / taskbar icon too.
 python -m PyInstaller `
     --noconfirm `
     --onefile `
     --windowed `
     --name JWTractor `
+    --icon icon.ico `
+    --add-data "icon.ico;." `
     --collect-all tkinterdnd2 `
     app.py
 

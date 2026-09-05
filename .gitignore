@@ -11,6 +11,9 @@ build/
 dist/
 *.spec
 
+# Generated at build time by make_icon.py
+icon.ico
+
 # Editor / OS
 .vscode/
 .idea/

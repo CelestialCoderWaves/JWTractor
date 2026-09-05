@@ -13,6 +13,7 @@ be unit-tested and reused from a CLI, the GUI, or anything else.
 from __future__ import annotations
 
 import base64
+import datetime
 import json
 import os
 import re
@@ -22,8 +23,14 @@ __all__ = [
     "find_tokens",
     "username_from_path",
     "extract_from_file",
+    "decode_token",
+    "summarize_claims",
+    "invalidation_notes",
     "DEFAULT_SEPARATOR",
+    "__version__",
 ]
+
+__version__ = "1.1.0"
 
 DEFAULT_SEPARATOR = "----"
 
@@ -78,6 +85,155 @@ def find_tokens(data: bytes) -> list[str]:
     return tokens
 
 
+def decode_token(token: str) -> dict:
+    """Decode a JWT's header and payload into Python objects.
+
+    The signature is **not** verified — this only base64url-decodes the two JSON
+    segments so the caller can inspect what the token claims. Either value is
+    ``None`` if that segment isn't valid JSON (rare, but possible for the
+    non-standard payloads some tools emit).
+
+    Raises ``ExtractionError`` if ``token`` isn't shaped like a JWT at all.
+    """
+    parts = token.split(".")
+    if len(parts) != 3:
+        raise ExtractionError("Not a well-formed JWT (expected three segments).")
+
+    def _segment(raw: str):
+        try:
+            return json.loads(_b64url_decode(raw.encode("ascii")))
+        except Exception:
+            return None
+
+    return {"header": _segment(parts[0]), "payload": _segment(parts[1])}
+
+
+# Common registered JWT claims (RFC 7519) plus Steam-specific fields,
+# in a sensible display order.
+_CLAIM_LABELS = (
+    ("iss", "Issuer"),
+    ("sub", "Subject"),
+    ("aud", "Audience"),
+    ("iat", "Issued"),
+    ("nbf", "Not before"),
+    ("exp", "Expires"),
+    ("jti", "Token ID"),
+    ("oat", "Original auth"),
+    ("per", "Permissions"),
+    # ("ip_subject", "IP (subject)"),
+    # ("ip_confirmer", "IP (confirmer)"),
+)
+_TIME_CLAIMS = {"iat", "nbf", "exp", "oat"}
+
+
+def _format_timestamp(value) -> str:
+    """Render a NumericDate claim as a readable UTC string (``value`` on failure)."""
+    try:
+        moment = datetime.datetime.fromtimestamp(
+            int(value), tz=datetime.timezone.utc
+        )
+    except (ValueError, TypeError, OverflowError, OSError):
+        return str(value)
+    return moment.strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _time_delta_text(seconds: float) -> str:
+    """Human-friendly delta like '3d 12h' or '7mo 2d'."""
+    s = abs(seconds)
+    if s < 3600:
+        return f"{int(s // 60)}m"
+    if s < 86400:
+        return f"{int(s // 3600)}h {int((s % 3600) // 60)}m"
+    days = int(s // 86400)
+    if days < 60:
+        return f"{days}d {int((s % 86400) // 3600)}h"
+    months = days // 30
+    remaining_days = days % 30
+    return f"{months}mo {remaining_days}d"
+
+
+def summarize_claims(payload) -> list[tuple[str, str]]:
+    """Return ``(label, value)`` rows for the common claims in ``payload``.
+
+    Timestamps are rendered as UTC; ``exp`` is annotated with how long until the
+    token expires (or how long ago it expired). Returns an empty list if
+    ``payload`` isn't a dict of claims. Intended for a compact, human-readable
+    preview (GUI panel or CLI summary).
+    """
+    if not isinstance(payload, dict):
+        return []
+
+    now = datetime.datetime.now(tz=datetime.timezone.utc).timestamp()
+    rows: list[tuple[str, str]] = []
+    for key, label in _CLAIM_LABELS:
+        if key not in payload:
+            continue
+        value = payload[key]
+        if key in _TIME_CLAIMS:
+            text = _format_timestamp(value)
+            if key == "exp":
+                try:
+                    exp_ts = int(value)
+                    delta = exp_ts - now
+                    if delta < 0:
+                        text += f"  (expired {_time_delta_text(delta)} ago)"
+                    else:
+                        text += f"  (in {_time_delta_text(delta)})"
+                except (ValueError, TypeError):
+                    pass
+            value = text
+        elif isinstance(value, list):
+            value = ", ".join(str(item) for item in value)
+        rows.append((label, str(value)))
+
+    # rows.extend(invalidation_notes(payload, now))
+    return rows
+
+
+def invalidation_notes(payload, now: float | None = None) -> list[tuple[str, str]]:
+    """Extra rows warning about non-exp invalidation scenarios.
+
+    A Steam refresh token can be revoked server-side even when ``exp`` hasn't
+    passed — e.g. after a password change or "deauthorize all devices". These
+    notes surface that context so the user doesn't assume "not expired" means
+    "still works".
+    """
+    if not isinstance(payload, dict):
+        return []
+    if now is None:
+        now = datetime.datetime.now(tz=datetime.timezone.utc).timestamp()
+
+    notes: list[tuple[str, str]] = []
+    iss = payload.get("iss", "")
+    exp = payload.get("exp")
+    oat = payload.get("oat")
+
+    if str(iss).lower() == "steam":
+        try:
+            exp_ts = int(exp)
+        except (TypeError, ValueError):
+            exp_ts = None
+
+        if exp_ts is not None and exp_ts > now:
+            notes.append(("Status", "NOT EXPIRED — but may be revoked (see below)"))
+        elif exp_ts is not None:
+            notes.append(("Status", "EXPIRED"))
+
+        reasons = []
+        reasons.append("Password changed on the account")
+        reasons.append("\"Deauthorize all devices\" used in Steam settings")
+        reasons.append("Steam Guard method changed")
+        notes.append(("Revoked if", " / ".join(reasons)))
+
+        if oat is not None:
+            notes.append(
+                ("Note", "Tokens issued before a password change are "
+                 "rejected regardless of exp")
+            )
+
+    return notes
+
+
 def username_from_path(path: str | os.PathLike) -> str:
     """The file's name without its extension (``ChadGreen.exe`` -> ``ChadGreen``)."""
     return os.path.splitext(os.path.basename(os.fspath(path)))[0]
@@ -93,6 +249,8 @@ def extract_from_file(
       - ``token``:      the first valid JWT found
       - ``combined``:   ``f"{username}{separator}{token}"`` (the thing you want)
       - ``all_tokens``: every distinct JWT found (usually just one)
+      - ``header``:     the first token's decoded header (dict, or ``None``)
+      - ``payload``:    the first token's decoded payload (dict, or ``None``)
 
     Raises ``ExtractionError`` if no token is present, and the usual OS errors
     (``FileNotFoundError`` etc.) if the file can't be read.
@@ -108,9 +266,12 @@ def extract_from_file(
 
     username = username_from_path(path)
     token = tokens[0]
+    decoded = decode_token(token)
     return {
         "username": username,
         "token": token,
         "combined": f"{username}{separator}{token}",
         "all_tokens": tokens,
+        "header": decoded["header"],
+        "payload": decoded["payload"],
     }
