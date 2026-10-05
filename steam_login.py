@@ -1,0 +1,542 @@
+"""SteamNFATool's local login workflow, implemented without Node.js.
+
+Only explicit calls to login_account change Steam. Parsing, merging, and file
+replacement are separate so tests can use synthetic accounts and temp files.
+JWT claims are checked locally; the signature and actual sign-in are not verified.
+"""
+
+from __future__ import annotations
+
+import base64
+import copy
+import ctypes
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import threading
+import time
+import uuid
+import zlib
+from contextlib import contextmanager
+from dataclasses import dataclass
+
+from steam import find_steam_dir
+
+MAX_INPUT = 64 * 1024
+MAX_CONFIG = 16 * 1024 * 1024
+IS_WINDOWS = os.name == "nt"
+
+
+class SteamLoginError(Exception):
+    """A user-facing failure; recovery_required keeps the installation locked."""
+
+    def __init__(self, message, *, recovery_required=False):
+        super().__init__(message)
+        self.recovery_required = recovery_required
+
+
+class LoginCancelled(SteamLoginError):
+    pass
+
+
+def _check_cancel(cancel):
+    if cancel is not None and cancel.is_set():
+        raise LoginCancelled("Cancelled.")
+
+
+def validate_account_name(name):
+    if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_.@-]{1,64}", name):
+        raise SteamLoginError("Use the Steam login name (letters, numbers, _, -, . or @; up to 64 characters).")
+    return name
+
+
+def validate_token(token, now=None):
+    if not isinstance(token, str) or len(token) > MAX_INPUT or not re.fullmatch(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", token):
+        raise SteamLoginError("Invalid JWT format.")
+    def decode(part):
+        raw = base64.b64decode(part + "=" * (-len(part) % 4), altchars=b"-_", validate=True)
+        if base64.urlsafe_b64encode(raw).decode().rstrip("=") != part:
+            raise ValueError("Noncanonical base64url")
+        return json.loads(raw.decode("utf-8"), parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
+    try:
+        header, payload = [decode(part) for part in token.split(".")[:2]]
+        if not isinstance(header, dict):
+            raise ValueError("Invalid header")
+    except (ValueError, UnicodeError, RecursionError):
+        raise SteamLoginError("Invalid JWT header or payload.") from None
+    if not isinstance(payload, dict) or not isinstance(payload.get("sub"), str) or not re.fullmatch(r"[0-9]{17}", payload["sub"]):
+        raise SteamLoginError('This is not a Steam login token: "sub" must be a 17-digit SteamID.')
+    for claim in ("exp", "nbf"):
+        if claim in payload and (type(payload[claim]) is not int or not 0 <= payload[claim] <= 8640000000000):
+            raise SteamLoginError(f'Token has an invalid "{claim}" timestamp.')
+    now = time.time() if now is None else now
+    if "exp" in payload and now >= payload["exp"]:
+        raise SteamLoginError("Token expired. Extract a current token before logging in.")
+    if "nbf" in payload and now < payload["nbf"]:
+        raise SteamLoginError("Token is not valid yet.")
+    return payload
+
+
+def cache_key(name):
+    return format(zlib.crc32(name.encode("utf-8")) & 0xffffffff, "x") + "1"
+
+
+def parse_vdf(text):
+    """Parse strict KeyValues, refusing duplicates or unsupported directives."""
+    if len(text.encode("utf-8")) > MAX_CONFIG or re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", text):
+        raise SteamLoginError("VDF is too large or contains unsupported control characters.")
+    position = 0
+    def next_token():
+        nonlocal position
+        while position < len(text):
+            if text[position].isspace():
+                position += 1
+            elif text.startswith("//", position):
+                end = text.find("\n", position)
+                position = len(text) if end < 0 else end + 1
+            else:
+                break
+        if position == len(text):
+            return None
+        char = text[position]
+        position += 1
+        if char in "{}":
+            return (char, char)
+        if char == '"':
+            value = []
+            while position < len(text):
+                char = text[position]
+                position += 1
+                if char == '"':
+                    return ("string", "".join(value))
+                if char == "\\":
+                    if position == len(text):
+                        raise SteamLoginError("Unterminated VDF escape.")
+                    escaped = text[position]
+                    position += 1
+                    value.append({"n": "\n", "r": "\r", "t": "\t", '"': '"', "\\": "\\"}.get(escaped, "\\" + escaped))
+                else:
+                    value.append(char)
+            raise SteamLoginError("Unterminated VDF string.")
+        start = position - 1
+        while position < len(text) and not text[position].isspace() and text[position] not in '{}"' and not text.startswith("//", position):
+            position += 1
+        value = text[start:position]
+        if any(char in value for char in "[]#"):
+            raise SteamLoginError("VDF directives and conditionals are unsupported; file was not changed.")
+        return ("string", value)
+    def read_object(nested=False, depth=0):
+        if depth > 64:
+            raise SteamLoginError("VDF nesting is too deep.")
+        result, keys = {}, set()
+        while True:
+            key = next_token()
+            if key is None:
+                if nested:
+                    raise SteamLoginError("Missing closing VDF brace.")
+                return result
+            if key[0] == "}":
+                if not nested:
+                    raise SteamLoginError("Unexpected closing VDF brace.")
+                return result
+            if key[0] != "string":
+                raise SteamLoginError("Expected a VDF key.")
+            normalized = key[1].lower()
+            if normalized in keys:
+                raise SteamLoginError("Duplicate VDF key; file was not changed.")
+            keys.add(normalized)
+            value = next_token()
+            if value is None or value[0] not in ("{", "string"):
+                raise SteamLoginError("Missing VDF value.")
+            result[key[1]] = read_object(True, depth + 1) if value[0] == "{" else value[1]
+    return read_object()
+
+
+def serialize_vdf(data, depth=0):
+    if not isinstance(data, dict) or depth > 64:
+        raise SteamLoginError("Invalid or excessively nested VDF object.")
+    def quote(value):
+        return '"' + re.sub(r'[\\"\n\r\t]', lambda match: {"\\": "\\\\", '"': '\\"', "\n": "\\n", "\r": "\\r", "\t": "\\t"}[match[0]], value) + '"'
+    tab, lines = "\t" * depth, []
+    for key, value in data.items():
+        if not isinstance(key, str):
+            raise SteamLoginError("VDF keys must be strings.")
+        if isinstance(value, dict):
+            lines.append(f"{tab}{quote(key)}\n{tab}{{\n{serialize_vdf(value, depth + 1)}{tab}}}\n")
+        elif isinstance(value, str):
+            lines.append(f"{tab}{quote(key)}\t\t{quote(value)}\n")
+        else:
+            raise SteamLoginError("VDF values must be strings or objects.")
+    return "".join(lines)
+
+
+def _key(root, key):
+    return next((existing for existing in root if existing.lower() == key.lower()), key)
+
+
+def _set(root, key, value):
+    root[_key(root, key)] = value
+
+
+def _section(root, *keys, create=False):
+    for requested in keys:
+        key = _key(root, requested)
+        if key not in root:
+            if not create:
+                return {}
+            root[key] = {}
+        if not isinstance(root[key], dict):
+            raise SteamLoginError("Unexpected VDF section type; file was not changed.")
+        root = root[key]
+    return root
+
+
+def assert_preservation(before, after, steam_id, account_name):
+    """Only selected-account fields and MostRecent flags are allowed to change."""
+    account_path = ("installconfigstore", "software", "valve", "steam", "accounts", account_name.lower(), "steamid")
+    token_path = ("machineuserconfigstore", "software", "valve", "steam", "connectcache", cache_key(account_name))
+    selected_fields = {"accountname", "personaname", "rememberpassword", "wantsofflinemode", "skipofflinemodewarning", "allowautologin", "mostrecent", "timestamp"}
+    def compare(old, new, document, parts=()):
+        if old == new:
+            return
+        if document == 0 and parts == account_path and new == steam_id:
+            return
+        if document == 2 and parts == token_path and isinstance(new, str):
+            return
+        if document == 1 and len(parts) == 3 and parts[0] == "users":
+            if parts[1] == steam_id and parts[2] in selected_fields and isinstance(new, str):
+                return
+            if parts[1] != steam_id and parts[2] == "mostrecent" and new == "0":
+                return
+        if isinstance(new, dict) and (isinstance(old, dict) or old is None):
+            old = {key.lower(): value for key, value in (old or {}).items()}
+            new = {key.lower(): value for key, value in new.items()}
+            for key in old.keys() | new.keys():
+                compare(old.get(key), new.get(key), document, parts + (key,))
+            return
+        raise SteamLoginError("Account preservation check failed: unrelated settings or credentials would change. No files were written.")
+    if len(before) != 3 or len(after) != 3:
+        raise SteamLoginError("Expected all three Steam configuration documents.")
+    for index, (old, new) in enumerate(zip(before, after)):
+        compare(old, new, index)
+
+
+def merge_account(documents, steam_id, account_name, encrypted, timestamp):
+    """Return new documents; leave originals untouched even on failure."""
+    config, login_users, local = copy.deepcopy(documents)
+    accounts = _section(config, "InstallConfigStore", "Software", "Valve", "Steam", "Accounts", create=True)
+    users = _section(login_users, "users", create=True)
+    selected = _section(accounts, account_name)
+    known_id = selected.get(_key(selected, "SteamID"))
+    if known_id and known_id != steam_id:
+        raise SteamLoginError("This login name belongs to a different saved SteamID. Existing accounts were not changed.")
+    names = set(accounts)
+    for user_id, user in users.items():
+        if not isinstance(user, dict):
+            raise SteamLoginError("Unexpected loginusers.vdf entry; file was not changed.")
+        name = user.get(_key(user, "AccountName"))
+        if not isinstance(name, str) or not name:
+            continue
+        names.add(name)
+        same_name = name.lower() == account_name.lower()
+        if (user_id == steam_id and not same_name) or (user_id != steam_id and same_name):
+            raise SteamLoginError("The selected account conflicts with a saved login. Existing accounts were not changed.")
+    for name in names:
+        if name.lower() != account_name.lower() and cache_key(name) == cache_key(account_name):
+            raise SteamLoginError("Account credential-cache collision. Existing accounts were not changed.")
+    _set(_section(accounts, account_name, create=True), "SteamID", steam_id)
+    for user in users.values():
+        _set(user, "MostRecent", "0")
+    user = _section(users, steam_id, create=True)
+    fields = {"AccountName": account_name, "PersonaName": user.get(_key(user, "PersonaName"), account_name),
+              "RememberPassword": "1", "WantsOfflineMode": "0", "SkipOfflineModeWarning": "0",
+              "AllowAutoLogin": "1", "MostRecent": "1", "Timestamp": str(timestamp)}
+    for key, value in fields.items():
+        _set(user, key, value)
+    _set(_section(local, "MachineUserConfigStore", "Software", "Valve", "Steam", "ConnectCache", create=True), cache_key(account_name), encrypted)
+    result = [config, login_users, local]
+    assert_preservation(documents, result, steam_id, account_name)
+    return result
+
+
+@dataclass
+class ConfigFile:
+    path: Path
+    original: bytes | None
+    data: dict
+
+
+def _read_original(path):
+    path = Path(path)
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(info.st_mode) or path.is_symlink():
+        raise SteamLoginError("Expected a regular configuration file, not a directory or symbolic link.")
+    if info.st_size > MAX_CONFIG:
+        raise SteamLoginError("Configuration exceeds 16 MiB.")
+    with path.open("rb") as handle:
+        content = handle.read(MAX_CONFIG + 1)
+    if len(content) > MAX_CONFIG:
+        raise SteamLoginError("Configuration exceeds 16 MiB.")
+    return content
+
+
+def read_config(path):
+    path = Path(path)
+    try:
+        original = _read_original(path)
+        data = {} if original is None else parse_vdf(original.decode("utf-8-sig"))
+        return ConfigFile(path, original, data)
+    except (OSError, UnicodeError, SteamLoginError) as exc:
+        raise SteamLoginError(f"Cannot read {path.name}: {exc}") from None
+
+
+def _write_exclusive(path, content):
+    # Never remove a pre-existing file when exclusive creation itself fails.
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        Path(path).unlink(missing_ok=True)
+        raise
+
+
+def _write_atomic(path, content, expected, cancel=None):
+    temp = Path(str(path) + f".{uuid.uuid4()}.tmp")
+    _write_exclusive(temp, content)
+    try:
+        if _read_original(path) != expected:
+            raise SteamLoginError(f"{path.name} changed during login; file was not overwritten.")
+        _check_cancel(cancel)
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+@contextmanager
+def config_lock(path):
+    # Share the lock name with SteamNFATool so the two apps cannot overlap.
+    lock = Path(str(path) + ".steam-nfa.lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        _write_exclusive(lock, json.dumps({"pid": os.getpid(), "started": time.time()}).encode())
+    except FileExistsError:
+        raise SteamLoginError(f"Another login may be active. After a crash, close Steam and review the configuration and backups before removing {lock}.") from None
+    recovery_required = False
+    try:
+        yield
+    except BaseException as exc:
+        recovery_required = getattr(exc, "recovery_required", False)
+        raise
+    finally:
+        if not recovery_required:
+            lock.unlink(missing_ok=True)
+
+
+def write_configs(configs, cancel=None):
+    """Call under config_lock; back up exact bytes and roll back failed writes."""
+    _check_cancel(cancel)
+    paths = [os.path.normcase(os.path.abspath(config.path)) for config in configs]
+    if len(set(paths)) != len(paths):
+        raise SteamLoginError("Duplicate configuration paths.")
+    prepared = []
+    for config in configs:
+        text = serialize_vdf(config.data)
+        parse_vdf(text)
+        content = text.encode("utf-8")
+        if len(content) > MAX_CONFIG:
+            raise SteamLoginError("Updated configuration exceeds 16 MiB.")
+        prepared.append((config, content))
+    backups, written = {}, []
+    try:
+        for config, content in prepared:
+            _check_cancel(cancel)
+            if _read_original(config.path) != config.original:
+                raise SteamLoginError(f"{config.path.name} changed during login; retry with Steam closed.")
+            config.path.parent.mkdir(parents=True, exist_ok=True)
+            if config.original is not None:
+                backup = Path(str(config.path) + f".{uuid.uuid4()}.bak")
+                _write_exclusive(backup, config.original)
+                backups[config.path] = backup
+        for config, content in prepared:
+            _write_atomic(config.path, content, config.original, cancel)
+            written.append((config, content))
+        _check_cancel(cancel)
+        return list(backups.values())
+    except Exception as exc:
+        failed = []
+        for config, content in reversed(written):
+            try:
+                if _read_original(config.path) != content:
+                    raise SteamLoginError("File changed after replacement.")
+                if config.original is None:
+                    config.path.unlink()
+                else:
+                    _write_atomic(config.path, config.original, content)
+            except Exception:
+                failed.append(f"{config.path} (backup: {backups.get(config.path, 'none; new file')})")
+        recovery = " Could not safely restore: " + "; ".join(failed) if failed else ""
+        error_type = LoginCancelled if isinstance(exc, LoginCancelled) else SteamLoginError
+        raise error_type(f"Configuration update failed: {exc}{recovery}", recovery_required=bool(failed)) from None
+
+
+def encrypt_with_dpapi(token, account_name):
+    """Encrypt under the current Windows user with username entropy, as in Node."""
+    if not IS_WINDOWS:
+        raise SteamLoginError("Steam login requires Windows.")
+    validate_account_name(account_name)
+    if not isinstance(token, str) or not 0 < len(token) <= MAX_INPUT:
+        raise SteamLoginError("Token is missing or too long.")
+    from ctypes import wintypes
+    class Blob(ctypes.Structure):
+        _fields_ = [("size", wintypes.DWORD), ("data", ctypes.POINTER(ctypes.c_ubyte))]
+    def blob(value):
+        buffer = (ctypes.c_ubyte * len(value)).from_buffer_copy(value)
+        return Blob(len(value), buffer), buffer
+    plain, plain_buffer = blob(token.encode("utf-8"))
+    entropy, entropy_buffer = blob(account_name.encode("utf-8"))
+    encrypted = Blob()
+    crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+    protect = crypt32.CryptProtectData
+    protect.argtypes = [ctypes.POINTER(Blob), wintypes.LPCWSTR, ctypes.POINTER(Blob), ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(Blob)]
+    protect.restype = wintypes.BOOL
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    try:
+        if not protect(ctypes.byref(plain), None, ctypes.byref(entropy), None, None, 1, ctypes.byref(encrypted)):
+            raise SteamLoginError("Windows token encryption failed; no Steam configuration was changed.")
+        return ctypes.string_at(encrypted.data, encrypted.size).hex()
+    finally:
+        if encrypted.data:
+            kernel32.LocalFree(ctypes.cast(encrypted.data, ctypes.c_void_p))
+        ctypes.memset(plain_buffer, 0, len(plain_buffer))
+        ctypes.memset(entropy_buffer, 0, len(entropy_buffer))
+
+
+def _windows_command(name):
+    return str(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / name)
+
+
+def _run(args):
+    return subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                          errors="replace", check=True, timeout=15,
+                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
+def _steam_running():
+    result = _run([_windows_command("tasklist.exe"), "/FI", "IMAGENAME eq steam*", "/FO", "CSV", "/NH"])
+    return bool(re.search(r'^"(?:steam|steamwebhelper)\.exe"', result.stdout, re.I | re.M))
+
+
+def close_steam(steam_dir, cancel=None):
+    _check_cancel(cancel)
+    try:
+        if not _steam_running():
+            return
+        try:
+            _run([str(Path(steam_dir) / "steam.exe"), "-shutdown"])
+        except (OSError, subprocess.SubprocessError):
+            _check_cancel(cancel)
+            if _steam_running():
+                raise SteamLoginError("Could not close Steam. Exit Steam and any running games, then retry.") from None
+            return
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            _check_cancel(cancel)
+            if not _steam_running():
+                return
+            if cancel is not None:
+                cancel.wait(0.5)
+            else:
+                time.sleep(0.5)
+    except (OSError, subprocess.SubprocessError):
+        raise SteamLoginError("Could not check whether Steam is closed. No configuration was changed.") from None
+    raise SteamLoginError("Steam is still running. Exit Steam and any running games, then retry. No configuration was changed.")
+
+
+def _find_installation():
+    candidates = []
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam") as key:
+            value, _ = winreg.QueryValueEx(key, "SteamPath")
+            candidates.append(value)
+    except OSError:
+        pass
+    candidates.append(find_steam_dir())
+    for base in (os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles"), os.environ.get("LOCALAPPDATA")):
+        if base:
+            candidates.append(str(Path(base) / "Steam"))
+    for candidate in candidates:
+        if isinstance(candidate, str) and (Path(candidate) / "steam.exe").is_file():
+            return Path(candidate)
+    raise SteamLoginError("Steam installation not found. Install Steam and run it once.")
+
+
+def _set_autologin(account_name):
+    import winreg
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam") as key:
+        winreg.SetValueEx(key, "AutoLoginUser", 0, winreg.REG_SZ, account_name)
+
+
+def _launch_steam(steam_dir):
+    subprocess.Popen([str(Path(steam_dir) / "steam.exe")], stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
+def login_account(account_name, token, *, cancel=None, progress=None):
+    """Log in the selected account; never use a display alias as the login name."""
+    if not IS_WINDOWS:
+        raise SteamLoginError("Steam login is available on Windows only.")
+    progress = progress or (lambda message: None)
+    _check_cancel(cancel)
+    validate_account_name(account_name)
+    payload = validate_token(token)
+    installation = _find_installation()
+    local_base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+    paths = [installation / "config" / "config.vdf", installation / "config" / "loginusers.vdf", local_base / "Steam" / "local.vdf"]
+    with config_lock(paths[0]):
+        progress("Preparing Steam login…")
+        encrypted = encrypt_with_dpapi(token, account_name)
+        for path in paths:
+            read_config(path)  # Reject invalid files before closing the client.
+        _check_cancel(cancel)
+        progress("Closing Steam…")
+        close_steam(installation, cancel)
+        _check_cancel(cancel)
+        configs = [read_config(path) for path in paths]
+        validate_token(token)  # Recheck after waiting for shutdown.
+        originals = [config.data for config in configs]
+        updated = merge_account(originals, payload["sub"], account_name, encrypted, int(time.time()))
+        for config, data in zip(configs, updated):
+            config.data = data
+        progress("Saving account; keeping other remembered accounts…")
+        backups = write_configs(configs, cancel)
+        def check_after_save():
+            if cancel is not None and cancel.is_set():
+                raise LoginCancelled("Cancelled after configuration was saved. Steam was not launched.")
+        check_after_save()
+        warning = None
+        try:
+            _set_autologin(account_name)
+        except OSError:
+            warning = "Select the account in Steam; the automatic selection could not be updated."
+        check_after_save()
+        progress("Launching Steam…")
+        try:
+            _launch_steam(installation)
+        except OSError:
+            raise SteamLoginError("Configuration was saved, but Steam could not be launched. Open Steam manually.") from None
+        users = _section(originals[1], "users")
+        return {"steam_id": payload["sub"], "backups": [str(path) for path in backups],
+                "preserved_accounts": sum(user_id != payload["sub"] for user_id in users), "warning": warning}

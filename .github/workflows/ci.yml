@@ -25,7 +25,7 @@ jobs:
       - name: Install pytest
         run: python -m pip install --upgrade pip pytest
 
-      # The tests only import extractor.py / extract.py (no tkinter), so they
-      # run headless on every OS.
+      # GUI tests skip when Tk/display is unavailable. All Steam processes and
+      # registry writes are mocked; DPAPI uses synthetic data on Windows only.
       - name: Run tests
         run: python -m pytest -q

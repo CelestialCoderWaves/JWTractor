@@ -16,7 +16,9 @@ platform's native, boxy Tk controls.
 from __future__ import annotations
 
 import os
+import queue
 import sys
+import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
@@ -29,6 +31,7 @@ from extractor import (
     summarize_claims,
 )
 from store import Store, account_combined, account_label
+from steam_login import LoginCancelled, SteamLoginError, login_account, validate_account_name, validate_token
 
 # --- optional real drag-and-drop -------------------------------------------
 try:
@@ -322,6 +325,10 @@ class App:
         self.current_account = None  # the saved account currently shown, if any
         self._picker = None  # the open account-picker popup, if any
         self._picker_closed_at = 0.0
+        self._login_thread = None
+        self._login_cancel = threading.Event()
+        self._login_events = queue.Queue()
+        self._closing = False
 
         self._build_ui()
         self._fit_and_center()  # size the window to its content, then centre
@@ -329,7 +336,8 @@ class App:
 
         # Keyboard: Ctrl+C copies the result, Esc closes the window.
         root.bind("<Control-c>", lambda e: self._copy())
-        root.bind("<Escape>", lambda e: root.destroy())
+        root.bind("<Escape>", self._request_close)
+        root.protocol("WM_DELETE_WINDOW", self._request_close)
 
         if _DND_AVAILABLE:
             self.drop.drop_target_register(DND_FILES)
@@ -397,16 +405,22 @@ class App:
         self.details_card.pack(padx=PAD)
         self.details_inner = self.details_card.inner
 
-        # footer: copy action + status
+        # footer: actions above a wrapping status line
         footer = tk.Frame(self.root, bg=BG)
         footer.pack(fill="x", padx=PAD, pady=(20, 24))
+        actions = tk.Frame(footer, bg=BG)
+        actions.pack(fill="x")
 
-        self.copy_btn = RoundedButton(footer, "Copy", self._copy, style="primary", min_width=104)
+        self.copy_btn = RoundedButton(actions, "Copy", self._copy, style="secondary", min_width=104)
         self.copy_btn.pack(side="left")
         self.copy_btn.set_enabled(False)
+        self.login_btn = RoundedButton(actions, "Log in to Steam", self._login_to_steam, min_width=160)
+        self.login_btn.pack(side="left", padx=(10, 0))
+        self.login_btn.set_enabled(False)
 
-        self.status = tk.Label(footer, text="", bg=BG, fg=FG_MUTED, font=("Segoe UI", 9))
-        self.status.pack(side="right", pady=(11, 0))
+        self.status = tk.Label(footer, text="", bg=BG, fg=FG_MUTED, font=("Segoe UI", 9),
+                               wraplength=CONTENT_W, justify="left", anchor="w")
+        self.status.pack(fill="x", pady=(10, 0))
 
         # initial (empty) content — also sizes the two cards to their placeholders
         self._set_output("")
@@ -420,6 +434,8 @@ class App:
             self.process(paths[0], extra_files=len(paths) - 1)
 
     def _browse(self):
+        if self._login_thread is not None:
+            return
         path = filedialog.askopenfilename(
             title="Choose an executable",
             filetypes=[("Executables", "*.exe"), ("All files", "*.*")],
@@ -428,6 +444,8 @@ class App:
             self.process(path)
 
     def process(self, path: str, extra_files: int = 0):
+        if self._login_thread is not None:
+            return
         self._close_picker()
         name = os.path.basename(path)
         try:
@@ -447,6 +465,7 @@ class App:
 
         # remember this account so it can be re-selected later
         self.current_account = self.store.add(result["token"], result["username"])
+        self._refresh_login_action()
         self._refresh_saved()
 
         self._refit()
@@ -484,6 +503,8 @@ class App:
             self._picker_closed_at = time.monotonic()
 
     def _open_picker(self):
+        if self._login_thread is not None:
+            return
         accounts = self.store.ordered()
         self.root.update_idletasks()
         x = self.saved_btn.winfo_rootx()
@@ -590,6 +611,8 @@ class App:
             w.bind("<Leave>", lambda e, ww=w: ww.configure(fg=FG_MUTED), add="+")
 
     def _use_account(self, acc):
+        if self._login_thread is not None:
+            return
         self._close_picker()
         self._set_output(account_combined(acc))
         try:
@@ -598,6 +621,7 @@ class App:
             payload = None
         self._set_details(summarize_claims(payload))
         self.current_account = acc
+        self._refresh_login_action()
         self.store.touch(acc["id"])
         self._refresh_saved()
         self._refit()
@@ -628,8 +652,89 @@ class App:
             self.store.remove(acc["id"])
             if self.current_account and self.current_account.get("id") == acc["id"]:
                 self.current_account = None
+                self._refresh_login_action()
             self._refresh_saved()
         self._open_picker()
+
+    # -- Steam login ---------------------------------------------------------
+    def _refresh_login_action(self):
+        busy = self._login_thread is not None
+        self.login_btn.set_text("Cancel login" if busy else "Log in to Steam")
+        self.login_btn.set_enabled(busy or (os.name == "nt" and self.current_account is not None))
+        self.saved_btn.set_enabled(not busy)
+        self.copy_btn.set_enabled(bool(self.result_text) and not busy)
+
+    def _login_to_steam(self):
+        if self._login_thread is not None:
+            self._login_cancel.set()
+            self.login_btn.set_enabled(False)
+            self._set_status("Cancelling Steam login…")
+            return
+        if self.current_account is None:
+            return
+        account = dict(self.current_account)
+        try:
+            # Use the original login name, never the friendly display alias.
+            validate_account_name(account.get("username"))
+            validate_token(account.get("token"))
+        except SteamLoginError as exc:
+            self._set_status(str(exc), ERR)
+            self._refit()
+            return
+        self._close_picker()
+        self._login_cancel.clear()
+        self._login_thread = threading.Thread(target=self._login_worker, args=(account,), name="Steam login")
+        self._refresh_login_action()
+        self._set_status("Preparing Steam login…")
+        self._login_thread.start()
+        self.root.after(80, self._drain_login_events)
+
+    def _login_worker(self, account):
+        try:
+            result = login_account(account["username"], account["token"], cancel=self._login_cancel,
+                                   progress=lambda message: self._login_events.put(("progress", message)))
+            self._login_events.put(("done", result))
+        except LoginCancelled as exc:
+            self._login_events.put(("cancelled", str(exc)))
+        except SteamLoginError as exc:
+            self._login_events.put(("error", str(exc)))
+        except Exception:
+            self._login_events.put(("error", "Unexpected Steam login failure. Check Steam and its configuration backups before retrying."))
+
+    def _drain_login_events(self):
+        while True:
+            try:
+                kind, value = self._login_events.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "progress":
+                if not self._login_cancel.is_set():
+                    self._set_status(value)
+                continue
+            self._login_thread = None
+            if self._closing:
+                self.root.destroy()
+                return
+            self._refresh_login_action()
+            if kind == "done":
+                if value.get("warning"):
+                    self._set_status(f"Steam launched. {value['warning']}", "#facc15")
+                else:
+                    self._set_status(f"Steam launched — check the client to confirm sign-in. Kept {value['preserved_accounts']} other remembered account(s).", OK)
+            else:
+                self._set_status(value, FG_MUTED if kind == "cancelled" else ERR)
+            self._refit()
+        if self._login_thread is not None:
+            self.root.after(80, self._drain_login_events)
+
+    def _request_close(self, *_):
+        if self._login_thread is not None:
+            self._closing = True
+            self._login_cancel.set()
+            self.login_btn.set_enabled(False)
+            self._set_status("Cancelling Steam login before closing…")
+            return
+        self.root.destroy()
 
     # -- output helpers ------------------------------------------------------
     def _set_output(self, text: str):
@@ -694,6 +799,8 @@ class App:
         self.details_card.fit(min_height=44)
 
     def _show_error(self, message: str):
+        self.current_account = None
+        self._refresh_login_action()
         self._set_output("")
         self._set_details([])
         self._refit()
@@ -701,9 +808,10 @@ class App:
 
     def _set_status(self, text: str, color: str = FG_MUTED):
         self.status.configure(text=text, fg=color)
+        self._refit()
 
     def _copy(self, announce: bool = True):
-        if not self.result_text:
+        if not self.result_text or self._login_thread is not None:
             return
         self.root.clipboard_clear()
         self.root.clipboard_append(self.result_text)

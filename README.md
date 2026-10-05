@@ -11,6 +11,10 @@ ChadGreen----eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSJ9.eyJpc3Mi...
 The result is **auto-copied to your clipboard**, so you can paste it straight
 away.
 
+On Windows, click **Log in to Steam** to use the extracted account directly,
+or select a saved account first. The login workflow is built into the Python
+app and standalone `.exe`; Node.js and SteamNFATool are not required.
+
 ## How it works
 
 The embedded string is a **JWT** — three base64url chunks separated by dots
@@ -34,16 +38,22 @@ running it:
 | [`extractor.py`](extractor.py) | The core logic: read bytes, find, validate & decode the JWT. No dependencies. |
 | [`app.py`](app.py) | The drag-and-drop GUI (tkinter), with a decoded-claims preview and saved accounts. |
 | [`store.py`](store.py) | Saves extracted tokens + your aliases to a local JSON file. No dependencies. |
+| [`steam_login.py`](steam_login.py) | Windows Steam login, DPAPI encryption, account preservation, backups and rollback. Uses the Python standard library. |
+| [`steam.py`](steam.py) | Steam installation detection and separate backup/restore helpers. |
 | [`extract.py`](extract.py) | A command-line version (batch, `--decode`, `--all`, `--token-only`, …). |
 | [`tests/test_extractor.py`](tests/test_extractor.py) | Core tests, using a **synthetic** token (no real data). |
 | [`tests/test_cli.py`](tests/test_cli.py) | Command-line tests, also using the synthetic token. |
 | [`tests/test_store.py`](tests/test_store.py) | Saved-account store tests (temp files, synthetic tokens). |
+| [`tests/test_steam_login.py`](tests/test_steam_login.py) | Login workflow and account-preservation tests using temporary files and synthetic tokens. |
+| [`tests/test_app_login.py`](tests/test_app_login.py) | Extraction, selection, login and cancellation UI tests with a mocked Steam backend. |
 | [`build.ps1`](build.ps1) | Builds the standalone `.exe` with PyInstaller. |
 | [`make_icon.py`](make_icon.py) | Build-time helper that draws the app/exe icon (`icon.ico`). |
 | [`requirements.txt`](requirements.txt) | The one optional dependency (`tkinterdnd2`). |
 
-The tool only ever **reads** the file you give it. It never modifies, uploads,
-or executes the input, and it makes **no network connections** of any kind.
+Extraction only **reads** the file you give it. It never modifies, uploads,
+or executes that input. The optional Steam login action updates local Steam
+configuration and launches the installed Steam client. JWTractor itself does
+not make network requests; Steam handles authentication.
 
 ## Quick start (from source)
 
@@ -79,6 +89,37 @@ Windows (`~/.config/JWTractor/accounts.json` elsewhere). **Treat that file as
 sensitive** — it holds real tokens, which are credentials. Delete it to wipe all
 saved accounts. Set the `JWTRACTOR_STORE` environment variable to keep it
 somewhere else.
+
+## Log in to Steam (Windows)
+
+1. Extract an account, or select it from **Saved accounts**.
+2. Click **Log in to Steam**. Steam closes normally, the account is saved,
+   and the client restarts. Check Steam to confirm sign-in.
+
+The filename must contain the actual Steam login name (`alice.exe` → `alice`),
+not the profile's display name. Saved aliases are for display only; login uses
+the original username. Invalid or expired tokens are rejected before Steam is
+closed. JWT claims are checked locally; their signatures are not verified.
+
+The other accounts' saved credentials and remember-login settings are preserved.
+Only the selected account's login fields and the most-recent account selection
+change. Steam still decides whether each saved session is valid. Preservation is
+tested with synthetic accounts; real account sign-in requires client verification.
+
+Login runs in the background. **Cancel login**, Escape, or closing the window
+requests cancellation; the window waits for cleanup before exiting. Cancellation
+during replacement attempts to restore the originals. Cancellation after saving
+reports that state and prevents Steam from being launched.
+
+Tokens are encrypted with Windows DPAPI before configuration changes; there is
+no plaintext fallback. Each existing configuration file receives a unique `.bak`
+copy beside it. Failed replacements trigger rollback without overwriting detected
+external edits. Backups can contain credentials and are retained for recovery.
+JWTractor and SteamNFATool share the same installation lock. A crash or failed
+rollback can leave `config.vdf.steam-nfa.lock` in place: close Steam, confirm no
+login is running, inspect the files and backups, and recover as necessary before
+manually removing the lock. File updates, registry selection and client launch
+are separate operations; forced termination can interrupt them.
 
 ## Command line
 
