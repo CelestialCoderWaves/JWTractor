@@ -8,6 +8,7 @@ and validation path.
 
 import os
 import sys
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -16,6 +17,7 @@ from extractor import (  # noqa: E402
     decode_token,
     extract_from_file,
     find_tokens,
+    parse_token_input,
     summarize_claims,
     username_from_path,
 )
@@ -125,3 +127,30 @@ def test_extract_from_file_includes_decoded(tmp_path):
     result = extract_from_file(path)
     assert result["header"]["alg"] == "EdDSA"
     assert result["payload"]["iss"] == "example"
+
+
+@pytest.mark.parametrize("text,name", [(SAMPLE_TOKEN, "alice"), (f"alice----{SAMPLE_TOKEN}", ""),
+                                     (f' "alice----{SAMPLE_TOKEN}" ', "alice"),
+                                     (f"alice----test----{SAMPLE_TOKEN}", ""),
+                                     (SAMPLE_TOKEN + "----suffix", "alice")])
+def test_direct_token_input_accepts_raw_and_combined_formats(text, name):
+    result = parse_token_input(text, name)
+    assert result["username"] == ("alice----test" if text.startswith("alice----test") else "alice")
+    assert result["header"]["alg"] == "EdDSA"
+    assert result["combined"] == result["username"] + "----" + result["token"]
+
+
+@pytest.mark.parametrize("text,name", [("", "alice"), ("a.b.c", "alice"), (SAMPLE_TOKEN, ""),
+                                     (SAMPLE_TOKEN, "bad name"), (f"alice----{SAMPLE_TOKEN}", "bob"),
+                                     (SAMPLE_TOKEN + "\n" + SAMPLE_TOKEN, "alice"),
+                                     (f"alice----{SAMPLE_TOKEN}\nbob----{SAMPLE_TOKEN}", ""),
+                                     ("x" * 65537, "alice")],
+                         ids=["empty", "bad-jwt", "missing-name", "bad-name", "name-mismatch", "two-raw", "two-combined", "oversized"])
+def test_direct_token_input_rejects_bad_or_ambiguous_paste(text, name):
+    with pytest.raises(ExtractionError):
+        parse_token_input(text, name)
+
+
+def test_direct_token_input_accepts_wrapped_token_lines():
+    wrapped = SAMPLE_TOKEN[:70] + "\n" + SAMPLE_TOKEN[70:]
+    assert parse_token_input(wrapped, "alice")["token"] == SAMPLE_TOKEN

@@ -77,6 +77,15 @@ def validate_token(token, now=None):
         raise SteamLoginError("Token expired. Extract a current token before logging in.")
     if "nbf" in payload and now < payload["nbf"]:
         raise SteamLoginError("Token is not valid yet.")
+    if payload.get("iss") != "steam":
+        raise SteamLoginError("Use a Steam-issued token for Steam login.")
+    audiences = payload.get("aud")
+    if not isinstance(audiences, list) or not all(isinstance(item, str) for item in audiences):
+        raise SteamLoginError("Token is missing its Steam audience claims.")
+    if "client" not in audiences:
+        raise SteamLoginError("This token cannot sign in to the Steam desktop client. Use a client refresh token.")
+    if "derive" not in audiences:
+        raise SteamLoginError("This is an access token. Steam desktop login needs a refresh token.")
     return payload
 
 
@@ -195,14 +204,17 @@ def _section(root, *keys, create=False):
 
 
 def assert_preservation(before, after, steam_id, account_name):
-    """Only selected-account fields and MostRecent flags are allowed to change."""
+    """Allow selected-login fields, MostRecent flags and disabling the chooser."""
     account_path = ("installconfigstore", "software", "valve", "steam", "accounts", account_name.lower(), "steamid")
+    chooser_path = ("installconfigstore", "software", "webstorage", "auth", "alwaysshowuserchooser")
     token_path = ("machineuserconfigstore", "software", "valve", "steam", "connectcache", cache_key(account_name))
     selected_fields = {"accountname", "personaname", "rememberpassword", "wantsofflinemode", "skipofflinemodewarning", "allowautologin", "mostrecent", "timestamp"}
     def compare(old, new, document, parts=()):
         if old == new:
             return
         if document == 0 and parts == account_path and new == steam_id:
+            return
+        if document == 0 and parts == chooser_path and new == "0" and (old is None or isinstance(old, str)):
             return
         if document == 2 and parts == token_path and isinstance(new, str):
             return
@@ -248,6 +260,10 @@ def merge_account(documents, steam_id, account_name, encrypted, timestamp):
         if name.lower() != account_name.lower() and cache_key(name) == cache_key(account_name):
             raise SteamLoginError("Account credential-cache collision. Existing accounts were not changed.")
     _set(_section(accounts, account_name, create=True), "SteamID", steam_id)
+    # Steam's startup chooser overrides AutoLoginUser even when a saved token
+    # and MostRecent account are set. Disable only that preference for login.
+    auth = _section(config, "InstallConfigStore", "Software", "WebStorage", "Auth", create=True)
+    _set(auth, "AlwaysShowUserChooser", "0")
     for user in users.values():
         _set(user, "MostRecent", "0")
     user = _section(users, steam_id, create=True)
@@ -392,7 +408,7 @@ def encrypt_with_dpapi(token, account_name):
     """Encrypt under the current Windows user with username entropy, as in Node."""
     if not IS_WINDOWS:
         raise SteamLoginError("Steam login requires Windows.")
-    validate_account_name(account_name)
+    account_name = validate_account_name(account_name).lower()
     if not isinstance(token, str) or not 0 < len(token) <= MAX_INPUT:
         raise SteamLoginError("Token is missing or too long.")
     from ctypes import wintypes
@@ -494,13 +510,71 @@ def _launch_steam(steam_dir):
                      creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
 
+def parse_logon_result(text, steam_id):
+    """Read only Steam's response marker; never expose log arguments or tokens."""
+    pattern = r"LogOnResponse\(\)\s*:\s*\[(?:U:1:(\d+)|I:0:0)\]\s*'([^'\r\n]+)'"
+    for match in re.finditer(pattern, text):
+        account_id, response = match.groups()
+        if response == "OK":
+            return ("confirmed" if account_id == str(int(steam_id) & 0xffffffff) else "other_account", None)
+        reasons = {"Access Denied": "Access denied", "Invalid Password": "Invalid credentials",
+                   "Expired": "Session expired", "No Connection": "No connection",
+                   "Service Unavailable": "Service unavailable", "Rate Limit Exceeded": "Too many attempts",
+                   "Account Logon Denied": "Additional account approval required"}
+        return "rejected", reasons.get(response, "Login rejected")
+    return None
+
+
+def log_checkpoint(path):
+    try:
+        info = Path(path).stat()
+        return info.st_ino, info.st_size
+    except OSError:
+        return None, 0
+
+
+def wait_for_sign_in(path, steam_id, checkpoint, cancel=None, timeout=30):
+    """Follow new connection-log bytes only, with bounded reads and cancellation."""
+    identity, offset = checkpoint
+    pending = ""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if cancel is not None and cancel.is_set():
+            raise LoginCancelled("Cancelled while checking sign-in. Steam is already running; the saved configuration was kept.")
+        try:
+            with Path(path).open("rb") as handle:
+                info = os.fstat(handle.fileno())
+                if identity != info.st_ino or info.st_size < offset:
+                    offset, pending = 0, ""
+                identity = info.st_ino
+                handle.seek(offset)
+                chunk = handle.read(64 * 1024)
+                offset = handle.tell()
+            pending += chunk.decode("utf-8", errors="replace")
+            end = pending.rfind("\n")
+            if end >= 0:
+                outcome = parse_logon_result(pending[:end + 1], steam_id)
+                pending = pending[end + 1:][-4096:]
+                if outcome:
+                    return outcome
+            else:
+                pending = pending[-4096:]
+        except OSError:
+            pass
+        if cancel is not None:
+            cancel.wait(0.2)
+        else:
+            time.sleep(0.2)
+    return "unconfirmed", None
+
+
 def login_account(account_name, token, *, cancel=None, progress=None):
     """Log in the selected account; never use a display alias as the login name."""
     if not IS_WINDOWS:
         raise SteamLoginError("Steam login is available on Windows only.")
     progress = progress or (lambda message: None)
     _check_cancel(cancel)
-    validate_account_name(account_name)
+    account_name = validate_account_name(account_name).lower()
     payload = validate_token(token)
     installation = _find_installation()
     local_base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
@@ -533,10 +607,15 @@ def login_account(account_name, token, *, cancel=None, progress=None):
             warning = "Select the account in Steam; the automatic selection could not be updated."
         check_after_save()
         progress("Launching Steam…")
+        log_path = installation / "logs" / "connection_log.txt"
+        checkpoint = log_checkpoint(log_path)
         try:
             _launch_steam(installation)
         except OSError:
             raise SteamLoginError("Configuration was saved, but Steam could not be launched. Open Steam manually.") from None
+        progress("Waiting for Steam to confirm sign-in…")
+        sign_in, reason = wait_for_sign_in(log_path, payload["sub"], checkpoint, cancel)
         users = _section(originals[1], "users")
         return {"steam_id": payload["sub"], "backups": [str(path) for path in backups],
-                "preserved_accounts": sum(user_id != payload["sub"] for user_id in users), "warning": warning}
+                "preserved_accounts": sum(user_id != payload["sub"] for user_id in users), "warning": warning,
+                "sign_in": sign_in, "reason": reason}

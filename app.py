@@ -28,6 +28,7 @@ from extractor import (
     ExtractionError,
     decode_token,
     extract_from_file,
+    parse_token_input,
     summarize_claims,
 )
 from store import Store, account_combined, account_label
@@ -104,6 +105,7 @@ class RoundedButton(tk.Canvas):
         self.style = style
         self._text = text
         self._enabled = True
+        self._focused = False
 
         if style == "primary":
             self._c = (ACCENT, ACCENT_HI, ACCENT_LO)
@@ -117,7 +119,7 @@ class RoundedButton(tk.Canvas):
         width = max(min_width, self._font.measure(text) + 2 * pad_x)
         super().__init__(
             parent, width=width, height=height,
-            bg=self._parent_bg, highlightthickness=0, bd=0,
+            bg=self._parent_bg, highlightthickness=0, bd=0, takefocus=True,
         )
         self._cw, self._ch, self._rad = width, height, radius
         self._fill = self._c[0]
@@ -127,6 +129,10 @@ class RoundedButton(tk.Canvas):
         self.bind("<Leave>", self._leave)
         self.bind("<Button-1>", self._press)
         self.bind("<ButtonRelease-1>", self._release)
+        self.bind("<Return>", self._activate)
+        self.bind("<space>", self._activate)
+        self.bind("<FocusIn>", lambda e: self._focus(True))
+        self.bind("<FocusOut>", lambda e: self._focus(False))
 
     def _render(self):
         self.delete("all")
@@ -135,6 +141,8 @@ class RoundedButton(tk.Canvas):
         outline = fill
         if self._bordered:
             outline = BORDER_HI if (self._enabled and self._fill == self._c[1]) else BORDER
+        if self._focused and self._enabled:
+            outline = FG
         self.create_polygon(
             _round_rect(1, 1, self._cw - 1, self._ch - 1, self._rad),
             smooth=True, fill=fill, outline=outline,
@@ -153,26 +161,130 @@ class RoundedButton(tk.Canvas):
 
     def _press(self, _):
         if self._enabled:
+            self.focus_set()
             self._fill = self._c[2]
             self._render()
 
-    def _release(self, _):
+    def _release(self, event):
         if not self._enabled:
             return
-        self._fill = self._c[1]
+        inside = 0 <= event.x < self._cw and 0 <= event.y < self._ch
+        self._fill = self._c[1] if inside else self._c[0]
         self._render()
-        if self.command:
+        if inside and self.command:
             self.command()
+
+    def _activate(self, _=None):
+        if self._enabled and self.command:
+            self.command()
+        return "break"
+
+    def _focus(self, on):
+        self._focused = on
+        self._render()
 
     def set_enabled(self, on):
         self._enabled = bool(on)
         self._fill = self._c[0]
-        self.configure(cursor="hand2" if on else "arrow")
+        self.configure(cursor="hand2" if on else "arrow", takefocus=bool(on))
         self._render()
 
     def set_text(self, text):
         self._text = text
         self._render()
+
+
+class TokenDialog(tk.Toplevel):
+    """A themed, non-blocking dialog for one already extracted account."""
+
+    def __init__(self, parent, on_add, on_close):
+        super().__init__(parent, bg=BG)
+        self.title("Add an account — JWTractor")
+        self.transient(parent)
+        self.resizable(False, False)
+        self._on_add, self._on_close = on_add, on_close
+        try:
+            self.iconbitmap(_resource("icon.ico"))
+        except tk.TclError:
+            pass
+        body = tk.Frame(self, bg=BG)
+        body.pack(fill="both", expand=True, padx=24, pady=24)
+        tk.Label(body, text="Add an account", bg=BG, fg=FG,
+                 font=("Segoe UI Semibold", 16), anchor="w").pack(fill="x")
+        tk.Label(body, text="Paste a token you already have.", bg=BG, fg=FG_MUTED,
+                 font=("Segoe UI", 10), anchor="w").pack(fill="x", pady=(4, 20))
+        tk.Label(body, text="TOKEN", bg=BG, fg=FG_FAINT,
+                 font=("Segoe UI", 9, "bold"), anchor="w").pack(fill="x", pady=(0, 7))
+        self.token = tk.Text(body, width=1, height=5, wrap="char", bg=FIELD, fg=FG,
+                             insertbackground=FG, selectbackground=ACCENT_LO,
+                             font=("Consolas", 10), padx=10, pady=9, relief="flat", bd=0,
+                             highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT)
+        self.token.pack(fill="x")
+        tk.Label(body, text="Accepts a token alone or username----token.", bg=BG, fg=FG_MUTED,
+                 font=("Segoe UI", 9), anchor="w").pack(fill="x", pady=(7, 18))
+        tk.Label(body, text="STEAM LOGIN NAME", bg=BG, fg=FG_FAINT,
+                 font=("Segoe UI", 9, "bold"), anchor="w").pack(fill="x", pady=(0, 7))
+        self.username = tk.Entry(body, width=1, bg=FIELD, fg=FG, insertbackground=FG,
+                                 selectbackground=ACCENT_LO, font=("Segoe UI", 11), relief="flat", bd=0,
+                                 highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT)
+        self.username.pack(fill="x", ipady=8)
+        tk.Label(body, text="Leave blank if the pasted text includes the username.", bg=BG, fg=FG_MUTED,
+                 font=("Segoe UI", 9), wraplength=470, justify="left", anchor="w").pack(fill="x", pady=(7, 0))
+        self.error = tk.Label(body, text="", bg=BG, fg=ERR, font=("Segoe UI", 10),
+                               wraplength=470, justify="left", anchor="w")
+        self._actions = tk.Frame(body, bg=BG)
+        self._actions.pack(fill="x", pady=(22, 0))
+        self.add_btn = RoundedButton(self._actions, "Add account", self._submit, min_width=148)
+        self.add_btn.pack(side="right")
+        self.cancel_btn = RoundedButton(self._actions, "Cancel", self.close, style="secondary", min_width=110)
+        self.cancel_btn.pack(side="right", padx=(0, 10))
+        self.bind("<Escape>", self.close)
+        self.bind("<Control-Return>", self._submit)
+        self.username.bind("<Return>", self._submit)
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self._fit(center=True)
+        _use_dark_titlebar(self)
+        self.grab_set()
+        self._focus_job = self.after_idle(self.token.focus_set)
+
+    def _fit(self, center=False):
+        self.update_idletasks()
+        width, height = 520, self.winfo_reqheight()
+        position = ""
+        if center:
+            parent = self.master
+            x = parent.winfo_rootx() + (parent.winfo_width() - width) // 2
+            y = parent.winfo_rooty() + max(0, (parent.winfo_height() - height) // 2)
+            x = max(0, min(x, self.winfo_screenwidth() - width))
+            y = max(0, min(y, self.winfo_screenheight() - height))
+            position = f"+{x}+{y}"
+        self.geometry(f"{width}x{height}{position}")
+
+    def _submit(self, _=None):
+        try:
+            self._on_add(self.token.get("1.0", "end-1c"), self.username.get())
+        except ExtractionError as exc:
+            self.error.configure(text=str(exc))
+            self.error.pack(before=self._actions, fill="x", pady=(12, 0))
+            self._fit()
+            if "login name" in str(exc).lower():
+                self.username.focus_set()
+            else:
+                self.token.focus_set()
+        except OSError:
+            self.error.configure(text="Couldn't save the account. Check that the saved-accounts folder is writable and try again.")
+            self.error.pack(before=self._actions, fill="x", pady=(12, 0))
+            self._fit()
+        else:
+            self.close()
+        return "break"
+
+    def close(self, _=None):
+        self.after_cancel(self._focus_job)
+        self.grab_release()
+        self.destroy()
+        self._on_close()
+        return "break"
 
 
 class RoundedCard(tk.Canvas):
@@ -325,6 +437,7 @@ class App:
         self.current_account = None  # the saved account currently shown, if any
         self._picker = None  # the open account-picker popup, if any
         self._picker_closed_at = 0.0
+        self._token_dialog = None
         self._login_thread = None
         self._login_cancel = threading.Event()
         self._login_events = queue.Queue()
@@ -338,6 +451,7 @@ class App:
         root.bind("<Control-c>", lambda e: self._copy())
         root.bind("<Escape>", self._request_close)
         root.protocol("WM_DELETE_WINDOW", self._request_close)
+        root.bind("<MouseWheel>", self._scroll_content)
 
         if _DND_AVAILABLE:
             self.drop.drop_target_register(DND_FILES)
@@ -348,15 +462,24 @@ class App:
     # -- layout --------------------------------------------------------------
     def _section(self, text):
         return tk.Label(
-            self.root, text=text, bg=BG, fg=FG_FAINT,
+            self.content, text=text, bg=BG, fg=FG_FAINT,
             font=("Segoe UI", 9, "bold"), anchor="w",
         )
 
     def _build_ui(self):
         self._mono = tkfont.Font(family="Consolas", size=10)  # result font + metrics
+        self.viewport = tk.Canvas(self.root, width=WIN_W, bg=BG, bd=0, highlightthickness=0)
+        self.viewport.pack(fill="both", expand=True)
+        self.content = tk.Frame(self.viewport, bg=BG)
+        self.viewport.create_window(0, 0, window=self.content, anchor="nw", width=WIN_W)
+        self.scrollbar = tk.Canvas(self.viewport, bg=BG, bd=0, highlightthickness=0, cursor="hand2")
+        self.viewport.configure(yscrollcommand=self._update_scrollbar)
+        self.viewport.bind("<Configure>", lambda _: self._update_scrollbar(*self.viewport.yview()))
+        self.scrollbar.bind("<Button-1>", self._drag_scrollbar)
+        self.scrollbar.bind("<B1-Motion>", self._drag_scrollbar)
 
         # header: logo tile + title/subtitle
-        header = tk.Frame(self.root, bg=BG)
+        header = tk.Frame(self.content, bg=BG)
         header.pack(fill="x", padx=PAD, pady=(24, 0))
 
         logo = tk.Canvas(header, width=46, height=46, bg=BG, highlightthickness=0, bd=0)
@@ -369,18 +492,21 @@ class App:
             titles, text=APP_TITLE, bg=BG, fg=FG, font=("Segoe UI Semibold", 19)
         ).pack(anchor="w")
         tk.Label(
-            titles, text="Pull the embedded token out of an .exe.",
+            titles, text="Extract or paste a token, then log in.",
             bg=BG, fg=FG_MUTED, font=("Segoe UI", 10),
         ).pack(anchor="w", pady=(1, 0))
+        self.paste_btn = RoundedButton(header, "Paste token", self._open_token_dialog,
+                                       style="secondary", min_width=132, pad_x=14)
+        self.paste_btn.pack(side="right", pady=(3, 0))
 
         # drop zone
-        self.drop = DropZone(self.root, CONTENT_W, 130, self._browse, dnd=_DND_AVAILABLE)
+        self.drop = DropZone(self.content, CONTENT_W, 130, self._browse, dnd=_DND_AVAILABLE)
         self.drop.pack(padx=PAD, pady=(18, 0))
 
         # saved accounts — pick one you've pulled before
         self._section("SAVED ACCOUNTS").pack(fill="x", padx=PAD, pady=(20, 7))
         self.saved_btn = RoundedButton(
-            self.root, self._saved_btn_text(), self._toggle_picker,
+            self.content, self._saved_btn_text(), self._toggle_picker,
             style="secondary", min_width=CONTENT_W,
         )
         self.saved_btn.pack(padx=PAD)
@@ -389,7 +515,7 @@ class App:
 
         # result
         self._section("RESULT").pack(fill="x", padx=PAD, pady=(22, 7))
-        self.result_card = RoundedCard(self.root, CONTENT_W, fill=FIELD, border=BORDER)
+        self.result_card = RoundedCard(self.content, CONTENT_W, fill=FIELD, border=BORDER)
         self.result_card.pack(padx=PAD)
         self._text_padx = 4
         self.output = tk.Text(
@@ -401,13 +527,13 @@ class App:
 
         # details (decoded claims)
         self._section("DETAILS").pack(fill="x", padx=PAD, pady=(18, 7))
-        self.details_card = RoundedCard(self.root, CONTENT_W, fill=SURFACE, border=BORDER)
+        self.details_card = RoundedCard(self.content, CONTENT_W, fill=SURFACE, border=BORDER)
         self.details_card.pack(padx=PAD)
         self.details_inner = self.details_card.inner
 
         # footer: actions above a wrapping status line
         footer = tk.Frame(self.root, bg=BG)
-        footer.pack(fill="x", padx=PAD, pady=(20, 24))
+        footer.pack(side="bottom", before=self.viewport, fill="x", padx=PAD, pady=(20, 24))
         actions = tk.Frame(footer, bg=BG)
         actions.pack(fill="x")
 
@@ -460,16 +586,11 @@ class App:
             self._show_error(f"Unexpected error: {exc}")
             return
 
-        self._set_output(result["combined"])
-        self._set_details(summarize_claims(result["payload"]))
-
-        # remember this account so it can be re-selected later
-        self.current_account = self.store.add(result["token"], result["username"])
-        self._refresh_login_action()
-        self._refresh_saved()
-
-        self._refit()
-        self._copy(announce=False)
+        try:
+            self._accept_result(result)
+        except OSError:
+            self._set_status("Couldn't save the account. Check the saved-accounts folder and try again.", ERR)
+            return
 
         note = ""
         if len(result["all_tokens"]) > 1:
@@ -477,6 +598,40 @@ class App:
         elif extra_files:
             note = f"  ·  {extra_files} more ignored (drop one at a time)"
         self._set_status(f"Extracted from {name} — copied · saved{note}", OK)
+
+    def _accept_result(self, result):
+        # Save successfully before replacing the current account or result.
+        account = self.store.add(result["token"], result["username"])
+        self.current_account = account
+        self._set_output(result["combined"])
+        self._set_details(summarize_claims(result["payload"]))
+        self._refresh_login_action()
+        self._refresh_saved()
+        self._refit()
+        self._copy(announce=False)
+        return account
+
+    # -- direct token entry --------------------------------------------------
+    def _open_token_dialog(self):
+        if self._login_thread is not None:
+            return
+        if self._token_dialog is not None:
+            self._token_dialog.lift()
+            self._token_dialog.token.focus_set()
+            return
+        self._close_picker()
+        self._token_dialog = TokenDialog(self.root, self._add_token, self._token_dialog_closed)
+
+    def _token_dialog_closed(self):
+        self._token_dialog = None
+        self.paste_btn.focus_set()
+
+    def _add_token(self, text, username=""):
+        if self._login_thread is not None:
+            raise ExtractionError("Wait for Steam login to finish before adding an account.")
+        account = self._accept_result(parse_token_input(text, username))
+        self._set_status(f"Added {account_label(account)} — copied · saved", OK)
+        return account
 
     # -- saved accounts ------------------------------------------------------
     def _saved_btn_text(self) -> str:
@@ -662,6 +817,7 @@ class App:
         self.login_btn.set_text("Cancel login" if busy else "Log in to Steam")
         self.login_btn.set_enabled(busy or (os.name == "nt" and self.current_account is not None))
         self.saved_btn.set_enabled(not busy)
+        self.paste_btn.set_enabled(not busy)
         self.copy_btn.set_enabled(bool(self.result_text) and not busy)
 
     def _login_to_steam(self):
@@ -717,10 +873,19 @@ class App:
                 return
             self._refresh_login_action()
             if kind == "done":
-                if value.get("warning"):
+                sign_in = value.get("sign_in", "unconfirmed")
+                count = value["preserved_accounts"]
+                preserved = f"Kept {count} other remembered account{'s' if count != 1 else ''}."
+                if sign_in == "rejected":
+                    self._set_status(f"Steam rejected sign-in: {value.get('reason') or 'Login rejected'}. Check the session with the account owner.", ERR)
+                elif sign_in == "other_account":
+                    self._set_status("Steam signed in to a different account. Select the account you added in Steam.", "#facc15")
+                elif sign_in == "confirmed":
+                    self._set_status(f"Signed in to Steam. {preserved}", OK)
+                elif value.get("warning"):
                     self._set_status(f"Steam launched. {value['warning']}", "#facc15")
                 else:
-                    self._set_status(f"Steam launched — check the client to confirm sign-in. Kept {value['preserved_accounts']} other remembered account(s).", OK)
+                    self._set_status(f"Steam launched; sign-in wasn't confirmed. Check the client. {preserved}", FG_MUTED)
             else:
                 self._set_status(value, FG_MUTED if kind == "cancelled" else ERR)
             self._refit()
@@ -823,9 +988,10 @@ class App:
     # -- misc ----------------------------------------------------------------
     def _fit_and_center(self):
         """Size the window to its content's requested size, then centre it."""
+        self._refit()
         self.root.update_idletasks()
         w = self.root.winfo_reqwidth()
-        h = self.root.winfo_reqheight()
+        h = self.root.winfo_height()
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
         x = (sw - w) // 2
@@ -835,9 +1001,33 @@ class App:
     def _refit(self):
         """Resize the window to its content's height, keeping its position."""
         self.root.update_idletasks()
-        w = self.root.winfo_reqwidth()
-        h = self.root.winfo_reqheight()
-        self.root.geometry(f"{w}x{h}")
+        content_height = self.content.winfo_reqheight()
+        self.viewport.configure(height=content_height, scrollregion=(0, 0, WIN_W, content_height))
+        self.root.update_idletasks()
+        h = min(self.root.winfo_reqheight(), self.root.winfo_screenheight() - 120)
+        y = max(0, min(self.root.winfo_y(), self.root.winfo_screenheight() - h - 80))
+        self.root.geometry(f"{WIN_W}x{h}+{max(0, self.root.winfo_x())}+{y}")
+
+    def _update_scrollbar(self, first, last):
+        first, last = float(first), float(last)
+        if last - first >= 0.999:
+            self.scrollbar.place_forget()
+            return
+        self.scrollbar.place(relx=1, x=-12, y=8, width=6, relheight=1, height=-16)
+        height = max(1, self.viewport.winfo_height() - 16)
+        self.scrollbar.delete("all")
+        self.scrollbar.create_polygon(_round_rect(0, first * height, 6, max(first * height + 8, last * height), 3),
+                                      smooth=True, fill=BORDER_HI, outline="")
+
+    def _drag_scrollbar(self, event):
+        first, last = self.viewport.yview()
+        self.viewport.yview_moveto(event.y / max(1, self.scrollbar.winfo_height()) - (last - first) / 2)
+
+    def _scroll_content(self, event):
+        if self.viewport.yview() != (0.0, 1.0):
+            direction = -1 if event.delta > 0 else 1
+            self.viewport.yview_scroll(direction * max(1, abs(event.delta) // 120) * 2, "units")
+            return "break"
 
 
 def main():

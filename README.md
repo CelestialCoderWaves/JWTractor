@@ -66,7 +66,8 @@ pip install -r requirements.txt
 python app.py
 ```
 
-Then drag an `.exe` onto the window, or click **Browse**.
+Then drag an `.exe` onto the window, click **Browse**, or click **Paste token**
+to add a token that has already been extracted.
 
 > `tkinterdnd2` is optional. Without it the window still works via the
 > **Browse** button and by dropping a file onto the app's icon; with it you
@@ -90,20 +91,48 @@ sensitive** — it holds real tokens, which are credentials. Delete it to wipe a
 saved accounts. Set the `JWTRACTOR_STORE` environment variable to keep it
 somewhere else.
 
+## Add an already extracted token
+
+Click **Paste token** and paste either `username----token` or the JWT alone.
+For a token alone, also enter its actual Steam login name. Input is visible.
+Click **Add account** (or press Ctrl+Enter) to save and select the account,
+show its decoded claims, and copy the combined string. You can then click
+**Log in to Steam**. Adding a token itself does not close or launch Steam.
+
+Validation errors appear inside the dialog, allowing you to correct the input.
+Re-adding the same token updates its saved entry and preserves its alias.
+Buttons support Tab, Enter, and Space; Escape closes the paste dialog.
+
 ## Log in to Steam (Windows)
 
-1. Extract an account, or select it from **Saved accounts**.
+1. Extract an account, add it using **Paste token**, or select it from **Saved accounts**.
 2. Click **Log in to Steam**. Steam closes normally, the account is saved,
    and the client restarts. Check Steam to confirm sign-in.
 
 The filename must contain the actual Steam login name (`alice.exe` → `alice`),
 not the profile's display name. Saved aliases are for display only; login uses
-the original username. Invalid or expired tokens are rejected before Steam is
-closed. JWT claims are checked locally; their signatures are not verified.
+the original username, normalized to lowercase for Steam's credential cache.
+Invalid, expired, web-only, and access tokens are rejected before Steam is
+closed. Desktop login requires a Steam client refresh token. JWT claims are
+checked locally; their signatures are not verified.
+
+After launch, JWTractor watches new Steam connection-log entries for up to 30
+seconds. It distinguishes confirmed sign-in to the selected account, a rejected
+login, and Steam signing in to another account. If no result is available, it
+asks you to check Steam. Rejection messages contain a known response description,
+never raw log content or credentials. Cancellation during this check leaves the
+already launched Steam client running.
+
+A future expiry does not prove a token still works: Steam can revoke a session.
+If Steam reports **Access denied**, confirm the session with the account owner
+or obtain a fresh client refresh token. JWTractor cannot override that rejection.
 
 The other accounts' saved credentials and remember-login settings are preserved.
 Only the selected account's login fields and the most-recent account selection
-change. Steam still decides whether each saved session is valid. Preservation is
+change, along with disabling Steam's **Ask which account to use each time Steam
+starts** preference so the selected account can sign in automatically. You can
+turn that preference back on in Steam. Steam still decides whether each saved
+session is valid. Preservation is
 tested with synthetic accounts; real account sign-in requires client verification.
 
 Login runs in the background. **Cancel login**, Escape, or closing the window
@@ -120,6 +149,9 @@ rollback can leave `config.vdf.steam-nfa.lock` in place: close Steam, confirm no
 login is running, inspect the files and backups, and recover as necessary before
 manually removing the lock. File updates, registry selection and client launch
 are separate operations; forced termination can interrupt them.
+
+The interface keeps its action buttons visible and scrolls the content when
+token details exceed the available screen height.
 
 ## Command line
 

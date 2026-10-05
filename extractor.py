@@ -23,6 +23,7 @@ __all__ = [
     "find_tokens",
     "username_from_path",
     "extract_from_file",
+    "parse_token_input",
     "decode_token",
     "summarize_claims",
     "invalidation_notes",
@@ -237,6 +238,54 @@ def invalidation_notes(payload, now: float | None = None) -> list[tuple[str, str
 def username_from_path(path: str | os.PathLike) -> str:
     """The file's name without its extension (``ChadGreen.exe`` -> ``ChadGreen``)."""
     return os.path.splitext(os.path.basename(os.fspath(path)))[0]
+
+
+def parse_token_input(text: str, username: str = "") -> dict:
+    """Accept one pasted JWT, or username----JWT, without reading a file.
+
+    Like file extraction, this checks the JWT header but does not verify its
+    signature or require an unexpired Steam session merely to inspect/save it.
+    """
+    if not isinstance(text, str) or not text.strip():
+        raise ExtractionError("Paste a token first.")
+    if len(text) > 64 * 1024:
+        raise ExtractionError("Paste one account at a time (maximum 64 KiB).")
+    if not isinstance(username, str):
+        raise ExtractionError("Enter the Steam login name.")
+    def clean(value):
+        value = value.strip()
+        if len(value) >= 2 and value[0] in "\"'" and value[-1] == value[0]:
+            value = value[1:-1].strip()
+        return value
+    def candidate(value):
+        token = re.sub(r"\s+", "", clean(value))
+        if not re.fullmatch(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", token):
+            return None
+        return token if _looks_like_jwt(token.encode("ascii")) else None
+    text, username = clean(text), clean(username)
+    token, pasted_name = None, ""
+    # Overlapping delimiters allow login names which themselves contain hyphens.
+    separator = text.find(DEFAULT_SEPARATOR)
+    while 0 <= separator <= 64:
+        possible = candidate(text[separator + len(DEFAULT_SEPARATOR):])
+        if possible:
+            pasted_name, token = text[:separator].strip(), possible
+            if username and pasted_name and username != pasted_name:
+                raise ExtractionError("The login name does not match the username in the pasted text. Leave the name field blank or use the same name.")
+            break
+        separator = text.find(DEFAULT_SEPARATOR, separator + 1)
+    token = token or candidate(text)
+    if not token:
+        raise ExtractionError("Paste one complete JWT token or username----token.")
+    username = username or pasted_name
+    if not username:
+        raise ExtractionError("Enter the Steam login name for this token.")
+    if not re.fullmatch(r"[A-Za-z0-9_.@-]{1,64}", username):
+        raise ExtractionError("Use a Steam login name with letters, numbers, _, -, . or @ (up to 64 characters).")
+    decoded = decode_token(token)
+    return {"username": username, "token": token,
+            "combined": f"{username}{DEFAULT_SEPARATOR}{token}", "all_tokens": [token],
+            "header": decoded["header"], "payload": decoded["payload"]}
 
 
 def extract_from_file(

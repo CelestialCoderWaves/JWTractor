@@ -22,7 +22,9 @@ DAVE = "76561198000000002"
 def jwt(payload=None):
     def encode(value):
         return base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip("=")
-    return ".".join([encode({"alg": "RS256"}), encode(payload if payload is not None else {"sub": ALICE, "exp": 9999999999}), "synthetic_signature"])
+    claims = {"sub": ALICE, "exp": 9999999999, "iss": "steam", "aud": ["client", "web", "renew", "derive"]}
+    claims.update(payload or {})
+    return ".".join([encode({"alg": "RS256"}), encode(claims), "synthetic_signature"])
 
 
 def remembered():
@@ -56,6 +58,64 @@ def test_token_and_name_validation():
     assert sl.cache_key("123456789") == "cbf439261"
 
 
+@pytest.mark.parametrize("claims", [{"iss": "other"}, {"aud": None}, {"aud": "client"},
+                                  {"aud": ["client", 1]}, {"aud": ["web", "renew"]},
+                                  {"aud": ["client", "web", "renew"]}])
+def test_login_requires_a_steam_client_refresh_token(claims):
+    with pytest.raises(sl.SteamLoginError):
+        sl.validate_token(jwt(claims))
+
+
+def test_refresh_token_without_renewal_permission_can_still_log_in():
+    assert sl.validate_token(jwt({"aud": ["client", "derive"]}))["sub"] == ALICE
+
+
+def response(steam_id=ALICE, result="OK"):
+    account = f"U:1:{int(steam_id) & 0xffffffff}" if result == "OK" else "I:0:0"
+    return f"[2026-10-05 08:30:43] CClientConnectionMgr::OnClientLogOnResponse() : [{account}] '{result}'\n"
+
+
+def test_logon_parser_confirms_only_the_selected_account_and_sanitizes_errors():
+    assert sl.parse_logon_result(response(), ALICE) == ("confirmed", None)
+    assert sl.parse_logon_result(response(BOB), ALICE) == ("other_account", None)
+    assert sl.parse_logon_result(response(result="Access Denied"), ALICE) == ("rejected", "Access denied")
+    assert sl.parse_logon_result(response(result="sensitive unknown error"), ALICE) == ("rejected", "Login rejected")
+    assert sl.parse_logon_result("processing complete\n", ALICE) is None
+
+
+def test_sign_in_monitor_ignores_old_success_and_reads_only_new_response(tmp_path):
+    path = tmp_path / "connection_log.txt"
+    path.write_text(response())
+    checkpoint = sl.log_checkpoint(path)
+    with path.open("a") as handle:
+        handle.write(response(result="Access Denied"))
+    assert sl.wait_for_sign_in(path, ALICE, checkpoint, timeout=1) == ("rejected", "Access denied")
+
+
+def test_sign_in_monitor_waits_for_a_complete_line(tmp_path):
+    path = tmp_path / "connection_log.txt"
+    path.write_text("")
+    checkpoint = sl.log_checkpoint(path)
+    partial = response().rstrip("\n")
+    path.write_text(partial)
+    assert sl.wait_for_sign_in(path, ALICE, checkpoint, timeout=0.01) == ("unconfirmed", None)
+    path.write_text(partial + "\n")
+    assert sl.wait_for_sign_in(path, ALICE, checkpoint, timeout=1) == ("confirmed", None)
+
+
+def test_sign_in_monitor_handles_truncated_logs_missing_logs_and_cancel(tmp_path):
+    path = tmp_path / "connection_log.txt"
+    path.write_text("old log " * 1000)
+    checkpoint = sl.log_checkpoint(path)
+    path.write_text(response())
+    assert sl.wait_for_sign_in(path, ALICE, checkpoint, timeout=1) == ("confirmed", None)
+    assert sl.wait_for_sign_in(tmp_path / "missing.txt", ALICE, (None, 0), timeout=0.01) == ("unconfirmed", None)
+    cancel = threading.Event()
+    cancel.set()
+    with pytest.raises(sl.LoginCancelled, match="already running"):
+        sl.wait_for_sign_in(path, ALICE, checkpoint, cancel)
+
+
 def test_vdf_round_trip_and_case_preservation():
     text = '// comment\nRoot { "Escaped" "quote\\\" slash\\\\ tab\\t line\\n café" Empty "" } "__proto__" safe'
     assert sl.parse_vdf(sl.serialize_vdf(sl.parse_vdf(text))) == sl.parse_vdf(text)
@@ -86,6 +146,41 @@ def test_merging_preserves_every_other_account_and_leaves_originals_untouched():
     selected = sl.merge_account(after, ALICE, "alice", "updated-synthetic-alice", 201)
     assert selected[1]["users"][ALICE]["PersonaName"] == "My name"
     assert selected[1]["users"][DAVE]["RememberPassword"] == "1"
+
+
+@pytest.mark.parametrize("value", [None, "0", "1"])
+def test_login_disables_startup_chooser_without_changing_other_auth_settings(value):
+    before = remembered()
+    auth = sl._section(before[0], "InstallConfigStore", "Software", "WebStorage", "Auth", create=True)
+    auth["KeepThisPreference"] = "synthetic-unchanged"
+    if value is not None:
+        auth["alwaysshowuserchooser"] = value
+    original = copy.deepcopy(before)
+    after = sl.merge_account(before, DAVE, "dave", "synthetic-dave", 200)
+    assert before == original
+    updated_auth = sl._section(after[0], "InstallConfigStore", "Software", "WebStorage", "Auth")
+    assert updated_auth[sl._key(updated_auth, "AlwaysShowUserChooser")] == "0"
+    assert updated_auth["KeepThisPreference"] == "synthetic-unchanged"
+    assert len(updated_auth) == 2
+    assert after[1]["users"][BOB] == before[1]["users"][BOB]
+    assert sl._section(after[2], "MachineUserConfigStore", "Software", "Valve", "Steam", "ConnectCache")[sl.cache_key("bob")] == "synthetic-bob"
+    sl.assert_preservation(before, after, DAVE, "dave")
+    updated_auth["KeepThisPreference"] = "changed"
+    with pytest.raises(sl.SteamLoginError, match="preservation"):
+        sl.assert_preservation(before, after, DAVE, "dave")
+
+
+def test_preservation_guard_cannot_enable_chooser_or_replace_an_auth_section():
+    before = remembered()
+    after = sl.merge_account(before, DAVE, "dave", "synthetic-dave", 200)
+    auth = sl._section(after[0], "InstallConfigStore", "Software", "WebStorage", "Auth")
+    auth["AlwaysShowUserChooser"] = "1"
+    with pytest.raises(sl.SteamLoginError, match="preservation"):
+        sl.assert_preservation(before, after, DAVE, "dave")
+    auth = sl._section(before[0], "InstallConfigStore", "Software", "WebStorage", "Auth", create=True)
+    auth["AlwaysShowUserChooser"] = {"Unexpected": "keep"}
+    with pytest.raises(sl.SteamLoginError, match="preservation"):
+        sl.merge_account(before, DAVE, "dave", "synthetic-dave", 200)
 
 
 def test_preservation_guard_rejects_deleted_credentials_or_changed_login_flags():
@@ -240,6 +335,7 @@ def workflow(tmp_path, monkeypatch):
     monkeypatch.setattr(sl, "close_steam", lambda path, cancel: calls.append("close"))
     monkeypatch.setattr(sl, "_set_autologin", lambda name: calls.append(("registry", name)))
     monkeypatch.setattr(sl, "_launch_steam", lambda path: calls.append("launch"))
+    monkeypatch.setattr(sl, "wait_for_sign_in", lambda *args: ("unconfirmed", None))
     return SimpleNamespace(paths=paths, calls=calls)
 
 
@@ -250,6 +346,17 @@ def test_complete_workflow_preserves_accounts_and_returns_backup_paths(workflow)
     assert workflow.calls == ["close", ("registry", "dave"), "launch"]
     users = sl.read_config(workflow.paths[1]).data["users"]
     assert users[BOB]["RememberPassword"] == "1"
+    auth = sl._section(sl.read_config(workflow.paths[0]).data, "InstallConfigStore", "Software", "WebStorage", "Auth")
+    assert auth["AlwaysShowUserChooser"] == "0"
+
+
+def test_login_normalizes_the_name_and_reports_the_client_result(workflow, monkeypatch):
+    monkeypatch.setattr(sl, "wait_for_sign_in", lambda *args: ("rejected", "Access denied"))
+    result = sl.login_account("DaVe", jwt({"sub": DAVE}))
+    assert ("registry", "dave") in workflow.calls
+    assert result["sign_in"] == "rejected"
+    assert result["reason"] == "Access denied"
+    assert sl.read_config(workflow.paths[1]).data["users"][BOB]["RememberPassword"] == "1"
 
 
 def test_encryption_or_invalid_config_failure_never_closes_steam(workflow, monkeypatch):

@@ -34,6 +34,8 @@ def window(tmp_path, monkeypatch, tk_root):
     monkeypatch.setattr(root, "clipboard_append", lambda value: None)
     application = gui.App(root)
     yield application
+    if application._token_dialog is not None:
+        application._token_dialog.close()
     application._login_cancel.set()
     if application._login_thread is not None:
         application._login_thread.join(timeout=3)
@@ -49,6 +51,14 @@ def finish(application):
         application.root.update()
         time.sleep(0.01)
     assert application._login_thread is None
+
+
+def wait_until_entered(application, event):
+    deadline = time.monotonic() + 2
+    while not event.is_set() and time.monotonic() < deadline:
+        application.root.update()
+        time.sleep(0.01)
+    assert event.is_set()
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Steam login button is Windows-only")
@@ -105,7 +115,7 @@ def test_cancel_button_keeps_window_responsive_and_reports_cancellation_once(win
         raise gui.LoginCancelled("Cancelled.")
     monkeypatch.setattr(gui, "login_account", login)
     window._login_to_steam()
-    assert entered.wait(1)
+    wait_until_entered(window, entered)
     window.root.update()
     window._login_to_steam()
     finish(window)
@@ -131,10 +141,107 @@ def test_closing_waits_for_worker_cleanup_before_destroying_window(window, monke
         raise gui.LoginCancelled("Cancelled.")
     monkeypatch.setattr(gui, "login_account", login)
     window._login_to_steam()
-    assert entered.wait(1)
+    wait_until_entered(window, entered)
     window._request_close()
     assert window._login_cancel.is_set()
     assert window.root.winfo_exists()
     release.set()
     finish(window)
     assert not window.root.winfo_exists()
+
+
+def test_paste_dialog_adds_account_and_selects_it_without_logging_in(window, monkeypatch):
+    monkeypatch.setattr(gui, "login_account", lambda *args, **kwargs: pytest.fail("Adding a token must not start Steam login"))
+    window._open_token_dialog()
+    dialog = window._token_dialog
+    window._open_token_dialog()
+    assert window._token_dialog is dialog
+    dialog.token.insert("1.0", "alice----" + jwt())
+    dialog._submit()
+    assert window._token_dialog is None
+    assert window.current_account["username"] == "alice"
+    assert window.result_text == "alice----" + jwt()
+    assert len(window.store.accounts) == 1
+    assert window._login_thread is None
+    assert window.login_btn._enabled == (os.name == "nt")
+
+
+def test_raw_token_import_prompts_for_username_and_keeps_invalid_dialog_open(window):
+    window._open_token_dialog()
+    dialog = window._token_dialog
+    dialog.token.insert("1.0", jwt())
+    dialog._submit()
+    assert window._token_dialog is dialog
+    assert "login name" in dialog.error.cget("text")
+    assert window.store.accounts == []
+    dialog.username.insert(0, "alice")
+    dialog._submit()
+    assert window.current_account["username"] == "alice"
+    assert window._token_dialog is None
+
+
+def test_reimport_preserves_alias_and_deduplicates(window):
+    account = window._add_token("alice----" + jwt())
+    window.store.set_alias(account["id"], "Main")
+    window._add_token(jwt(), "alice")
+    assert len(window.store.accounts) == 1
+    assert window.current_account["alias"] == "Main"
+
+
+def test_paste_save_failure_keeps_prior_selection_and_shows_inline_error(window, monkeypatch):
+    old = window._add_token("alice----" + jwt())
+    old_result = window.result_text
+    window._open_token_dialog()
+    dialog = window._token_dialog
+    dialog.token.insert("1.0", "bob----" + jwt({"sub": "76561198000000001"}))
+    def fail():
+        raise PermissionError("Synthetic failure")
+    monkeypatch.setattr(window.store, "save", fail)
+    dialog._submit()
+    assert "Couldn't save" in dialog.error.cget("text")
+    assert window.current_account is old
+    assert window.result_text == old_result
+    assert window.store.accounts == [old]
+    assert window._token_dialog is dialog
+
+
+def test_import_dialog_layout_and_keyboard_controls(window):
+    window._open_token_dialog()
+    dialog = window._token_dialog
+    dialog.update_idletasks()
+    assert dialog.winfo_width() == 520
+    assert dialog._actions.winfo_reqwidth() <= 472
+    assert dialog.token.cget("wrap") == "char"
+    assert dialog.username.cget("show") == ""
+    dialog.token.insert("1.0", "alice----" + jwt())
+    dialog.add_btn._activate()
+    assert window.current_account["username"] == "alice"
+    window._open_token_dialog()
+    window._token_dialog.cancel_btn._activate()
+    assert window._token_dialog is None
+
+
+@pytest.mark.parametrize("sign_in,reason,expected", [
+    ("confirmed", None, "Signed in to Steam."),
+    ("rejected", "Access denied", "Steam rejected sign-in: Access denied."),
+    ("other_account", None, "different account"),
+])
+def test_login_result_status_reflects_client_response(window, sign_in, reason, expected):
+    window._login_events.put(("done", {"preserved_accounts": 1, "warning": None,
+                                      "sign_in": sign_in, "reason": reason}))
+    window._drain_login_events()
+    assert expected in window.status.cget("text")
+    assert "account(s)" not in window.status.cget("text")
+
+
+def test_long_account_details_scroll_on_small_screens_and_keep_actions_visible(window, monkeypatch):
+    monkeypatch.setattr(window.root, "winfo_screenheight", lambda: 720)
+    window._add_token("alice----" + jwt({"jti": "synthetic " * 300, "iat": 1790778246,
+                                         "nbf": 1782138246, "oat": 1790778246, "per": 1}))
+    window.root.deiconify()
+    window.root.update()
+    assert window.root.winfo_height() <= 600
+    assert window.viewport.yview()[1] < 1
+    assert window.login_btn.winfo_rooty() + window.login_btn.winfo_height() <= window.root.winfo_rooty() + window.root.winfo_height()
+    window.viewport.yview_moveto(1)
+    assert window.viewport.yview()[1] == 1

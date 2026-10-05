@@ -9,6 +9,7 @@ import json
 import os
 import sys
 import time
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -110,3 +111,27 @@ def test_corrupt_file_starts_empty(tmp_path):
 def test_default_store_path_env_override(monkeypatch):
     monkeypatch.setenv("JWTRACTOR_STORE", r"X:\custom\accounts.json")
     assert default_store_path() == r"X:\custom\accounts.json"
+
+
+def test_failed_add_does_not_leave_an_unsaved_account(tmp_path, monkeypatch):
+    store = Store(str(tmp_path / "accounts.json"))
+    def fail():
+        raise PermissionError("Synthetic write failure")
+    monkeypatch.setattr(store, "save", fail)
+    with pytest.raises(PermissionError):
+        store.add(ACTIVE, "alice")
+    assert store.accounts == []
+
+
+def test_failed_update_keeps_existing_account_and_alias(tmp_path, monkeypatch):
+    store = Store(str(tmp_path / "accounts.json"))
+    account = store.add(ACTIVE, "alice")
+    store.set_alias(account["id"], "Main")
+    before = dict(account)
+    def fail():
+        raise PermissionError("Synthetic write failure")
+    monkeypatch.setattr(store, "save", fail)
+    with pytest.raises(PermissionError):
+        store.add(ACTIVE, "different_name")
+    assert account == before
+    assert store.accounts == [account]

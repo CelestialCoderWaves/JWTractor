@@ -132,11 +132,17 @@ class Store:
 
         existing = self.get(_account_id(token))
         if existing is not None:
+            previous = dict(existing)
             existing.update(
                 username=username, separator=separator, last_used=now,
                 issuer=issuer, subject=subject, exp=exp,
             )
-            self.save()
+            try:
+                self.save()
+            except OSError:
+                existing.clear()
+                existing.update(previous)
+                raise
             return existing
 
         account = {
@@ -152,7 +158,11 @@ class Store:
             "exp": exp,
         }
         self.accounts.append(account)
-        self.save()
+        try:
+            self.save()
+        except OSError:
+            self.accounts.remove(account)
+            raise
         return account
 
     def set_alias(self, account_id: str, alias: str) -> None:
