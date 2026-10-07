@@ -35,6 +35,14 @@ def remembered():
     ]
 
 
+def current_remembered():
+    documents = remembered()
+    for user in documents[1]["users"].values():
+        user["AutoLogin"] = user.pop("MostRecent")
+        user.pop("AllowAutoLogin")
+    return documents
+
+
 def configs_on_disk(tmp_path):
     files = [tmp_path / name for name in ("config.vdf", "loginusers.vdf", "local.vdf")]
     for path, data in zip(files, remembered()):
@@ -148,17 +156,57 @@ def test_merging_preserves_every_other_account_and_leaves_originals_untouched():
     assert selected[1]["users"][DAVE]["RememberPassword"] == "1"
 
 
+@pytest.mark.parametrize("steam_id,name", [(ALICE, "alice"), (DAVE, "dave")])
+def test_current_steam_selects_account_using_autologin_and_preserves_credentials(steam_id, name):
+    before = current_remembered()
+    original = copy.deepcopy(before)
+    after = sl.merge_account(before, steam_id, name, "synthetic-selected", 200)
+    assert before == original
+    users = after[1]["users"]
+    assert users[steam_id]["AutoLogin"] == "1"
+    assert sum(user.get("AutoLogin") == "1" for user in users.values()) == 1
+    assert all("MostRecent" not in user and "AllowAutoLogin" not in user for user in users.values())
+    for user_id, user in before[1]["users"].items():
+        if user_id != steam_id:
+            assert users[user_id] == {**user, "AutoLogin": "0"}
+    old_cache = sl._section(before[2], "MachineUserConfigStore", "Software", "Valve", "Steam", "ConnectCache")
+    new_cache = sl._section(after[2], "MachineUserConfigStore", "Software", "Valve", "Steam", "ConnectCache")
+    assert all(new_cache[key] == value for key, value in old_cache.items() if key != sl.cache_key(name))
+    sl.assert_preservation(before, after, steam_id, name)
+
+
+def test_new_and_mixed_steam_formats_have_one_selected_account():
+    fresh = sl.merge_account([{}, {}, {}], DAVE, "dave", "synthetic", 200)
+    assert fresh[1]["users"][DAVE]["AutoLogin"] == "1"
+    assert "MostRecent" not in fresh[1]["users"][DAVE]
+    before = current_remembered()
+    before[1]["users"][ALICE]["MostRecent"] = "1"
+    after = sl.merge_account(before, DAVE, "dave", "synthetic", 200)
+    assert after[1]["users"][ALICE]["AutoLogin"] == "0"
+    assert after[1]["users"][ALICE]["MostRecent"] == "0"
+    assert after[1]["users"][DAVE]["AutoLogin"] == "1"
+    assert "MostRecent" not in after[1]["users"][BOB]
+
+
+def test_preservation_guard_rejects_enabling_another_modern_account():
+    before = current_remembered()
+    after = sl.merge_account(before, DAVE, "dave", "synthetic", 200)
+    after[1]["users"][BOB]["AutoLogin"] = "1"
+    with pytest.raises(sl.SteamLoginError, match="preservation"):
+        sl.assert_preservation(before, after, DAVE, "dave")
+
+
 @pytest.mark.parametrize("value", [None, "0", "1"])
 def test_login_disables_startup_chooser_without_changing_other_auth_settings(value):
     before = remembered()
-    auth = sl._section(before[0], "InstallConfigStore", "Software", "WebStorage", "Auth", create=True)
+    auth = sl._section(before[0], "InstallConfigStore", "WebStorage", "Auth", create=True)
     auth["KeepThisPreference"] = "synthetic-unchanged"
     if value is not None:
         auth["alwaysshowuserchooser"] = value
     original = copy.deepcopy(before)
     after = sl.merge_account(before, DAVE, "dave", "synthetic-dave", 200)
     assert before == original
-    updated_auth = sl._section(after[0], "InstallConfigStore", "Software", "WebStorage", "Auth")
+    updated_auth = sl._section(after[0], "InstallConfigStore", "WebStorage", "Auth")
     assert updated_auth[sl._key(updated_auth, "AlwaysShowUserChooser")] == "0"
     assert updated_auth["KeepThisPreference"] == "synthetic-unchanged"
     assert len(updated_auth) == 2
@@ -173,14 +221,26 @@ def test_login_disables_startup_chooser_without_changing_other_auth_settings(val
 def test_preservation_guard_cannot_enable_chooser_or_replace_an_auth_section():
     before = remembered()
     after = sl.merge_account(before, DAVE, "dave", "synthetic-dave", 200)
-    auth = sl._section(after[0], "InstallConfigStore", "Software", "WebStorage", "Auth")
+    auth = sl._section(after[0], "InstallConfigStore", "WebStorage", "Auth")
     auth["AlwaysShowUserChooser"] = "1"
     with pytest.raises(sl.SteamLoginError, match="preservation"):
         sl.assert_preservation(before, after, DAVE, "dave")
-    auth = sl._section(before[0], "InstallConfigStore", "Software", "WebStorage", "Auth", create=True)
+    auth = sl._section(before[0], "InstallConfigStore", "WebStorage", "Auth", create=True)
     auth["AlwaysShowUserChooser"] = {"Unexpected": "keep"}
     with pytest.raises(sl.SteamLoginError, match="preservation"):
         sl.merge_account(before, DAVE, "dave", "synthetic-dave", 200)
+
+
+def test_chooser_preference_is_at_install_root_not_under_software():
+    before = current_remembered()
+    root_auth = sl._section(before[0], "InstallConfigStore", "WebStorage", "Auth", create=True)
+    root_auth["AlwaysShowUserChooser"] = "1"
+    other_auth = sl._section(before[0], "InstallConfigStore", "Software", "WebStorage", "Auth", create=True)
+    other_auth["AlwaysShowUserChooser"] = "1"
+    after = sl.merge_account(before, DAVE, "dave", "synthetic-dave", 200)
+    assert sl._section(after[0], "InstallConfigStore", "WebStorage", "Auth")["AlwaysShowUserChooser"] == "0"
+    assert sl._section(after[0], "InstallConfigStore", "Software", "WebStorage", "Auth") == other_auth
+    sl.assert_preservation(before, after, DAVE, "dave")
 
 
 def test_preservation_guard_rejects_deleted_credentials_or_changed_login_flags():
@@ -346,7 +406,7 @@ def test_complete_workflow_preserves_accounts_and_returns_backup_paths(workflow)
     assert workflow.calls == ["close", ("registry", "dave"), "launch"]
     users = sl.read_config(workflow.paths[1]).data["users"]
     assert users[BOB]["RememberPassword"] == "1"
-    auth = sl._section(sl.read_config(workflow.paths[0]).data, "InstallConfigStore", "Software", "WebStorage", "Auth")
+    auth = sl._section(sl.read_config(workflow.paths[0]).data, "InstallConfigStore", "WebStorage", "Auth")
     assert auth["AlwaysShowUserChooser"] == "0"
 
 
@@ -357,6 +417,19 @@ def test_login_normalizes_the_name_and_reports_the_client_result(workflow, monke
     assert result["sign_in"] == "rejected"
     assert result["reason"] == "Access denied"
     assert sl.read_config(workflow.paths[1]).data["users"][BOB]["RememberPassword"] == "1"
+
+
+def test_complete_workflow_writes_current_autologin_selection(workflow, monkeypatch):
+    for path, data in zip(workflow.paths, current_remembered()):
+        path.write_bytes(sl.serialize_vdf(data).encode())
+    monkeypatch.setattr(sl, "wait_for_sign_in", lambda *args: ("confirmed", None))
+    result = sl.login_account("dave", jwt({"sub": DAVE}))
+    users = sl.read_config(workflow.paths[1]).data["users"]
+    assert result["sign_in"] == "confirmed"
+    assert users[DAVE]["AutoLogin"] == "1"
+    assert users[ALICE]["AutoLogin"] == "0"
+    assert users[BOB]["RememberPassword"] == "1"
+    assert all("MostRecent" not in user for user in users.values())
 
 
 def test_encryption_or_invalid_config_failure_never_closes_steam(workflow, monkeypatch):

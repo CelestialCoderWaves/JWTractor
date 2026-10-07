@@ -128,9 +128,13 @@ If Steam reports **Access denied**, confirm the session with the account owner
 or obtain a fresh client refresh token. JWTractor cannot override that rejection.
 
 The other accounts' saved credentials and remember-login settings are preserved.
-Only the selected account's login fields and the most-recent account selection
-change, along with disabling Steam's **Ask which account to use each time Steam
-starts** preference so the selected account can sign in automatically. You can
+Only the selected account's login fields and the startup account selection
+change. Current Steam clients select an account with `AutoLogin`; older clients
+use `MostRecent` and `AllowAutoLogin`. JWTractor follows the format already in
+your file and uses `AutoLogin` for a new file. It also disables Steam's
+**Ask which account to use each time Steam starts** preference at
+`InstallConfigStore/WebStorage/Auth/AlwaysShowUserChooser` so the selected account
+can sign in automatically. You can
 turn that preference back on in Steam. Steam still decides whether each saved
 session is valid. Preservation is
 tested with synthetic accounts; real account sign-in requires client verification.

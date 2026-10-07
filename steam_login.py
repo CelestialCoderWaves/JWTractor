@@ -204,11 +204,11 @@ def _section(root, *keys, create=False):
 
 
 def assert_preservation(before, after, steam_id, account_name):
-    """Allow selected-login fields, MostRecent flags and disabling the chooser."""
+    """Allow selected-login fields, account selection and disabling the chooser."""
     account_path = ("installconfigstore", "software", "valve", "steam", "accounts", account_name.lower(), "steamid")
-    chooser_path = ("installconfigstore", "software", "webstorage", "auth", "alwaysshowuserchooser")
+    chooser_path = ("installconfigstore", "webstorage", "auth", "alwaysshowuserchooser")
     token_path = ("machineuserconfigstore", "software", "valve", "steam", "connectcache", cache_key(account_name))
-    selected_fields = {"accountname", "personaname", "rememberpassword", "wantsofflinemode", "skipofflinemodewarning", "allowautologin", "mostrecent", "timestamp"}
+    selected_fields = {"accountname", "personaname", "rememberpassword", "wantsofflinemode", "skipofflinemodewarning", "allowautologin", "autologin", "mostrecent", "timestamp"}
     def compare(old, new, document, parts=()):
         if old == new:
             return
@@ -221,7 +221,7 @@ def assert_preservation(before, after, steam_id, account_name):
         if document == 1 and len(parts) == 3 and parts[0] == "users":
             if parts[1] == steam_id and parts[2] in selected_fields and isinstance(new, str):
                 return
-            if parts[1] != steam_id and parts[2] == "mostrecent" and new == "0":
+            if parts[1] != steam_id and parts[2] in {"autologin", "mostrecent"} and new == "0":
                 return
         if isinstance(new, dict) and (isinstance(old, dict) or old is None):
             old = {key.lower(): value for key, value in (old or {}).items()}
@@ -260,16 +260,26 @@ def merge_account(documents, steam_id, account_name, encrypted, timestamp):
         if name.lower() != account_name.lower() and cache_key(name) == cache_key(account_name):
             raise SteamLoginError("Account credential-cache collision. Existing accounts were not changed.")
     _set(_section(accounts, account_name, create=True), "SteamID", steam_id)
-    # Steam's startup chooser overrides AutoLoginUser even when a saved token
-    # and MostRecent account are set. Disable only that preference for login.
-    auth = _section(config, "InstallConfigStore", "Software", "WebStorage", "Auth", create=True)
+    # The chooser overrides automatic selection even with a saved token.
+    auth = _section(config, "InstallConfigStore", "WebStorage", "Auth", create=True)
     _set(auth, "AlwaysShowUserChooser", "0")
+    # Current Steam uses AutoLogin in place of MostRecent/AllowAutoLogin.
+    # Keep legacy documents in their existing format; a new document uses the
+    # current format. Clear only selection flags which already exist.
+    modern_selection = (not users or any(_key(user, "AutoLogin") in user for user in users.values())
+                        or not any(_key(user, "MostRecent") in user for user in users.values()))
     for user in users.values():
-        _set(user, "MostRecent", "0")
+        for flag in ("AutoLogin", "MostRecent"):
+            if _key(user, flag) in user:
+                _set(user, flag, "0")
     user = _section(users, steam_id, create=True)
     fields = {"AccountName": account_name, "PersonaName": user.get(_key(user, "PersonaName"), account_name),
               "RememberPassword": "1", "WantsOfflineMode": "0", "SkipOfflineModeWarning": "0",
-              "AllowAutoLogin": "1", "MostRecent": "1", "Timestamp": str(timestamp)}
+              "Timestamp": str(timestamp)}
+    fields.update({"AutoLogin": "1"} if modern_selection else {"AllowAutoLogin": "1", "MostRecent": "1"})
+    for flag in ("AutoLogin", "MostRecent", "AllowAutoLogin"):
+        if _key(user, flag) in user:
+            fields[flag] = "1"
     for key, value in fields.items():
         _set(user, key, value)
     _set(_section(local, "MachineUserConfigStore", "Software", "Valve", "Steam", "ConnectCache", create=True), cache_key(account_name), encrypted)
