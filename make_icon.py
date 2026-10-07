@@ -16,7 +16,7 @@ from PIL import Image, ImageDraw
 
 ACCENT = (124, 108, 255, 255)  # #7c6cff
 WHITE = (255, 255, 255, 255)
-SCALE = 4  # supersample, then downscale for smooth edges
+SCALE = 8  # supersample, then downscale for smooth edges
 BASE = 256
 
 
@@ -29,15 +29,18 @@ def _draw(size: int) -> Image.Image:
 
     cx = s / 2
     w = max(1, int(s * 0.055))
-    # arrow shaft
-    d.line([(cx, s * 0.26), (cx, s * 0.60)], fill=WHITE, width=w)
+    def stroke(points):
+        d.line(points, fill=WHITE, width=w, joint="curve")
+        for x, y in points:
+            r = w / 2
+            d.ellipse((x - r, y - r, x + r, y + r), fill=WHITE)
+
+    # Rounded caps and joins remain smooth even at title-bar sizes.
+    stroke([(cx, s * 0.26), (cx, s * 0.60)])
     # arrow head (two strokes meeting at the tip)
-    d.line(
-        [(cx - s * 0.13, s * 0.46), (cx, s * 0.60), (cx + s * 0.13, s * 0.46)],
-        fill=WHITE, width=w, joint="curve",
-    )
+    stroke([(cx - s * 0.13, s * 0.46), (cx, s * 0.60), (cx + s * 0.13, s * 0.46)])
     # baseline (the "tray")
-    d.line([(s * 0.30, s * 0.72), (s * 0.70, s * 0.72)], fill=WHITE, width=w)
+    stroke([(s * 0.30, s * 0.72), (s * 0.70, s * 0.72)])
 
     return img.resize((size, size), Image.LANCZOS)
 

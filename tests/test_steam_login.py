@@ -11,6 +11,14 @@ from types import SimpleNamespace
 
 import pytest
 
+
+def test_launch_enables_steam_page_interface(tmp_path, monkeypatch):
+    import steam_login as sl
+    calls = []
+    monkeypatch.setattr(sl.subprocess, 'Popen', lambda args, **kwargs: calls.append(args))
+    sl._launch_steam(tmp_path)
+    assert calls == [[str(tmp_path / 'steam.exe'), '-cef-enable-debugging']]
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import steam_login as sl
 

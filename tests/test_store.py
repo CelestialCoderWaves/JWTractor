@@ -46,6 +46,20 @@ def test_add_and_persist(tmp_path):
     assert len(Store(path).accounts) == 1
 
 
+@pytest.mark.parametrize("operation", ["touch", "remove"])
+def test_account_mutation_save_failure_rolls_back(tmp_path, monkeypatch, operation):
+    store = Store(str(tmp_path / 'accounts.json'))
+    account = store.add(ACTIVE, "Alice")
+    account["last_used"] = 123
+    def fail():
+        raise PermissionError("Synthetic failure")
+    monkeypatch.setattr(store, "save", fail)
+    with pytest.raises(OSError):
+        getattr(store, operation)(account["id"])
+    assert store.accounts == [account]
+    assert account["last_used"] == 123
+
+
 def test_add_dedupes_same_token(tmp_path):
     store = Store(str(tmp_path / "accounts.json"))
     store.add(ACTIVE, "OldName")

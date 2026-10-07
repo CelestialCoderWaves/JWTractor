@@ -2,3 +2,4 @@
 # The app still runs without it (Browse button + drop-onto-icon), but installing
 # it gives you the nicer "drag the .exe onto the window" experience.
 tkinterdnd2>=0.4.0
+websocket-client>=1.9,<2

@@ -17,12 +17,16 @@ from __future__ import annotations
 
 import os
 import queue
+import re
 import sys
 import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
-from tkinter import filedialog, messagebox, simpledialog
+from tkinter import filedialog, messagebox
+from datetime import datetime, timezone
+
+from cooldown import check_client_cooldown, current_steam_session
 
 from extractor import (
     ExtractionError,
@@ -33,6 +37,7 @@ from extractor import (
 )
 from store import Store, account_combined, account_label
 from steam_login import LoginCancelled, SteamLoginError, login_account, validate_account_name, validate_token
+from toggle_graphics import BUTTON_ICONS, DROP_ICONS, LOGO_IMAGE, SURFACE_CORNERS, SWITCH_IMAGES
 
 # --- optional real drag-and-drop -------------------------------------------
 try:
@@ -62,7 +67,7 @@ DROP_BG_HI = "#1d2236"  # drop zone hover fill
 DROP_BORDER = "#303653"
 FG = "#eceef6"          # primary text
 FG_MUTED = "#9aa1b6"    # secondary text
-FG_FAINT = "#5f6884"    # labels / placeholder
+FG_FAINT = "#8490ad"    # readable labels / placeholder
 OK = "#4ade80"          # success
 ERR = "#f87171"         # error
 
@@ -70,7 +75,8 @@ ERR = "#f87171"         # error
 # (see App._fit_and_center) so nothing clips regardless of the platform's font
 # metrics. The cards likewise grow to fit their own content.
 WIN_W = 600
-PAD = 26                # left/right window padding
+PAD = 24                # equal outer margins
+GAP = 12                # shared spacing between controls and sections
 CONTENT_W = WIN_W - 2 * PAD
 
 
@@ -82,6 +88,34 @@ def _round_rect(x1, y1, x2, y2, r):
         x2 - r, y2, x1 + r, y2, x1, y2,
         x1, y2 - r, x1, y1 + r, x1, y1,
     ]
+
+
+def _paint_surface(canvas, width, height, radius, fill, border, tags="shape"):
+    """Nine-slice rendering keeps rounded edges smooth as a panel grows."""
+    key = (fill, border, radius)
+    corner = radius + 2
+    if key not in SURFACE_CORNERS or min(width, height) <= 2 * corner:
+        canvas.create_polygon(_round_rect(1, 1, width - 1, height - 1, radius),
+                              smooth=True, fill=fill, outline=border, tags=tags)
+        return
+    if not hasattr(canvas, "_surface_images"):
+        canvas._surface_images = {}
+    if key not in canvas._surface_images:
+        canvas._surface_images[key] = tuple(tk.PhotoImage(master=canvas, data=data)
+                                            for data in SURFACE_CORNERS[key])
+    sprites = canvas._surface_images[key]
+    canvas.create_rectangle(corner, corner, width - corner, height - corner,
+                            fill=fill, outline="", tags=tags)
+    for sprite, (x, y) in zip(sprites[:4], ((0, 0), (width - corner, 0),
+                                          (0, height - corner), (width - corner, height - corner))):
+        canvas.create_image(x, y, anchor="nw", image=sprite, tags=tags)
+    canvas._surface_edges = [sprites[4].zoom(width - 2 * corner, 1),
+                             sprites[5].zoom(width - 2 * corner, 1),
+                             sprites[6].zoom(1, height - 2 * corner),
+                             sprites[7].zoom(1, height - 2 * corner)]
+    for sprite, (x, y) in zip(canvas._surface_edges, ((corner, 0), (corner, height - corner),
+                                                    (0, corner), (width - corner, corner))):
+        canvas.create_image(x, y, anchor="nw", image=sprite, tags=tags)
 
 
 class RoundedButton(tk.Canvas):
@@ -106,6 +140,7 @@ class RoundedButton(tk.Canvas):
         self._text = text
         self._enabled = True
         self._focused = False
+        self._pressed = False
 
         if style == "primary":
             self._c = (ACCENT, ACCENT_HI, ACCENT_LO)
@@ -143,11 +178,8 @@ class RoundedButton(tk.Canvas):
             outline = BORDER_HI if (self._enabled and self._fill == self._c[1]) else BORDER
         if self._focused and self._enabled:
             outline = FG
-        self.create_polygon(
-            _round_rect(1, 1, self._cw - 1, self._ch - 1, self._rad),
-            smooth=True, fill=fill, outline=outline,
-        )
-        self.create_text(self._cw / 2, self._ch / 2 + 1, text=self._text, fill=fg, font=self._font)
+        _paint_surface(self, self._cw, self._ch, self._rad, fill, outline)
+        self.create_text(self._cw / 2, self._ch / 2, text=self._text, fill=fg, font=self._font, tags="label")
 
     def _enter(self, _):
         if self._enabled:
@@ -161,12 +193,14 @@ class RoundedButton(tk.Canvas):
 
     def _press(self, _):
         if self._enabled:
+            self._pressed = True
             self.focus_set()
             self._fill = self._c[2]
             self._render()
 
     def _release(self, event):
-        if not self._enabled:
+        pressed, self._pressed = self._pressed, False
+        if not self._enabled or not pressed:
             return
         inside = 0 <= event.x < self._cw and 0 <= event.y < self._ch
         self._fill = self._c[1] if inside else self._c[0]
@@ -185,6 +219,7 @@ class RoundedButton(tk.Canvas):
 
     def set_enabled(self, on):
         self._enabled = bool(on)
+        self._pressed = False
         self._fill = self._c[0]
         self.configure(cursor="hand2" if on else "arrow", takefocus=bool(on))
         self._render()
@@ -192,6 +227,61 @@ class RoundedButton(tk.Canvas):
     def set_text(self, text):
         self._text = text
         self._render()
+
+
+class NavigationButton(RoundedButton):
+    """Compact navigation with antialiased icons independent of system fonts."""
+
+    def __init__(self, parent, command):
+        self._icon = "settings"
+        self._icons = {}
+        super().__init__(parent, "Settings", command, style="secondary", height=28,
+                         radius=8, min_width=112, pad_x=12)
+
+    def set_destination(self, name):
+        self._icon = "back" if name == "accounts" else "settings"
+        self.set_text("Accounts" if name == "accounts" else "Settings")
+
+    def _render(self):
+        super()._render()
+        self.delete("label")
+        color = self._fg if self._enabled else "#5f6884"
+        key = (self._icon, color)
+        if key not in self._icons:
+            self._icons[key] = tk.PhotoImage(master=self, data=BUTTON_ICONS[key])
+        start = (self._cw - self._font.measure(self._text) - 18 - 8) / 2
+        self.create_image(start, self._ch / 2, anchor="w", image=self._icons[key])
+        self.create_text(start + 26, self._ch / 2, anchor="w", text=self._text,
+                         fill=color, font=self._font, tags="label")
+
+
+class ToggleSwitch(RoundedButton):
+    """Compact switch with the same mouse, focus and keyboard behavior as buttons."""
+
+    def __init__(self, parent, checked, command):
+        self.checked = bool(checked)
+        self._switch_images = {}
+        super().__init__(parent, "", command, height=32, radius=16, pad_x=0, min_width=70)
+
+    def set_checked(self, checked):
+        self.checked = bool(checked)
+        self._render()
+
+    def _render(self):
+        self.delete("all")
+        state = "normal"
+        if not self._enabled:
+            state = "disabled"
+        elif self._fill == self._c[2]:
+            state = "pressed"
+        elif self._fill == self._c[1]:
+            state = "hover"
+        key = (self.checked, state, self._focused and self._enabled)
+        if key not in self._switch_images:
+            self._switch_images[key] = tk.PhotoImage(master=self, data=SWITCH_IMAGES[key])
+        self.create_image(0, 0, anchor="nw", image=self._switch_images[key])
+        self.create_text(24 if self.checked else 45, 16, text="ON" if self.checked else "OFF",
+                         font=("Segoe UI", 8, "bold"), fill="white" if self._enabled else FG_FAINT)
 
 
 class TokenDialog(tk.Toplevel):
@@ -203,41 +293,43 @@ class TokenDialog(tk.Toplevel):
         self.transient(parent)
         self.resizable(False, False)
         self._on_add, self._on_close = on_add, on_close
+        self._closed = False
         try:
             self.iconbitmap(_resource("icon.ico"))
         except tk.TclError:
             pass
         body = tk.Frame(self, bg=BG)
-        body.pack(fill="both", expand=True, padx=24, pady=24)
+        body.pack(fill="both", expand=True, padx=PAD, pady=PAD)
         tk.Label(body, text="Add an account", bg=BG, fg=FG,
                  font=("Segoe UI Semibold", 16), anchor="w").pack(fill="x")
         tk.Label(body, text="Paste a token you already have.", bg=BG, fg=FG_MUTED,
-                 font=("Segoe UI", 10), anchor="w").pack(fill="x", pady=(4, 20))
+                 font=("Segoe UI", 10), anchor="w").pack(fill="x", pady=GAP)
         tk.Label(body, text="TOKEN", bg=BG, fg=FG_FAINT,
-                 font=("Segoe UI", 9, "bold"), anchor="w").pack(fill="x", pady=(0, 7))
+                 font=("Segoe UI", 9, "bold"), anchor="w").pack(fill="x", pady=(0, GAP))
         self.token = tk.Text(body, width=1, height=5, wrap="char", bg=FIELD, fg=FG,
                              insertbackground=FG, selectbackground=ACCENT_LO,
-                             font=("Consolas", 10), padx=10, pady=9, relief="flat", bd=0,
+                             font=("Consolas", 10), padx=GAP, pady=GAP, relief="flat", bd=0,
                              highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT)
         self.token.pack(fill="x")
         tk.Label(body, text="Accepts a token alone or username----token.", bg=BG, fg=FG_MUTED,
-                 font=("Segoe UI", 9), anchor="w").pack(fill="x", pady=(7, 18))
+                 font=("Segoe UI", 9), anchor="w").pack(fill="x", pady=GAP)
         tk.Label(body, text="STEAM LOGIN NAME", bg=BG, fg=FG_FAINT,
-                 font=("Segoe UI", 9, "bold"), anchor="w").pack(fill="x", pady=(0, 7))
+                 font=("Segoe UI", 9, "bold"), anchor="w").pack(fill="x", pady=(0, GAP))
         self.username = tk.Entry(body, width=1, bg=FIELD, fg=FG, insertbackground=FG,
                                  selectbackground=ACCENT_LO, font=("Segoe UI", 11), relief="flat", bd=0,
                                  highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT)
-        self.username.pack(fill="x", ipady=8)
+        self.username.pack(fill="x", ipady=GAP)
         tk.Label(body, text="Leave blank if the pasted text includes the username.", bg=BG, fg=FG_MUTED,
-                 font=("Segoe UI", 9), wraplength=470, justify="left", anchor="w").pack(fill="x", pady=(7, 0))
+                 font=("Segoe UI", 9), wraplength=470, justify="left", anchor="w").pack(fill="x", pady=(GAP, 0))
         self.error = tk.Label(body, text="", bg=BG, fg=ERR, font=("Segoe UI", 10),
                                wraplength=470, justify="left", anchor="w")
         self._actions = tk.Frame(body, bg=BG)
-        self._actions.pack(fill="x", pady=(22, 0))
-        self.add_btn = RoundedButton(self._actions, "Add account", self._submit, min_width=148)
+        self._actions.pack(fill="x", pady=(GAP, 0))
+        action_width = (520 - 2 * PAD - GAP) // 2
+        self.add_btn = RoundedButton(self._actions, "Add account", self._submit, min_width=action_width)
         self.add_btn.pack(side="right")
-        self.cancel_btn = RoundedButton(self._actions, "Cancel", self.close, style="secondary", min_width=110)
-        self.cancel_btn.pack(side="right", padx=(0, 10))
+        self.cancel_btn = RoundedButton(self._actions, "Cancel", self.close, style="secondary", min_width=action_width)
+        self.cancel_btn.pack(side="right", padx=(0, GAP))
         self.bind("<Escape>", self.close)
         self.bind("<Control-Return>", self._submit)
         self.username.bind("<Return>", self._submit)
@@ -265,7 +357,7 @@ class TokenDialog(tk.Toplevel):
             self._on_add(self.token.get("1.0", "end-1c"), self.username.get())
         except ExtractionError as exc:
             self.error.configure(text=str(exc))
-            self.error.pack(before=self._actions, fill="x", pady=(12, 0))
+            self.error.pack(before=self._actions, fill="x", pady=(GAP, 0))
             self._fit()
             if "login name" in str(exc).lower():
                 self.username.focus_set()
@@ -273,13 +365,16 @@ class TokenDialog(tk.Toplevel):
                 self.token.focus_set()
         except OSError:
             self.error.configure(text="Couldn't save the account. Check that the saved-accounts folder is writable and try again.")
-            self.error.pack(before=self._actions, fill="x", pady=(12, 0))
+            self.error.pack(before=self._actions, fill="x", pady=(GAP, 0))
             self._fit()
         else:
             self.close()
         return "break"
 
     def close(self, _=None):
+        if self._closed:
+            return "break"
+        self._closed = True
         self.after_cancel(self._focus_job)
         self.grab_release()
         self.destroy()
@@ -317,10 +412,7 @@ class RoundedCard(tk.Canvas):
 
     def _paint(self, height):
         self.delete("shape")
-        self.create_polygon(
-            _round_rect(1, 1, self._card_w - 1, height - 1, self._radius),
-            smooth=True, fill=self._fill, outline=self._border, tags="shape",
-        )
+        _paint_surface(self, self._card_w, height, self._radius, self._fill, self._border)
         self.tag_lower("shape")  # keep the inner window above the shape
 
     def fit(self, min_height=0):
@@ -329,6 +421,97 @@ class RoundedCard(tk.Canvas):
         height = max(min_height, self.inner.winfo_reqheight() + 2 * self.inset)
         self.configure(height=height)
         self._paint(height)
+
+
+class RenameDialog(tk.Toplevel):
+    """Themed account alias editor, using the app's existing cards and buttons."""
+
+    def __init__(self, parent, account, on_save, on_close):
+        super().__init__(parent, bg=BG)
+        self.title("Rename account — JWTractor")
+        self.transient(parent)
+        self.resizable(False, False)
+        self._on_save, self._on_close = on_save, on_close
+        self._closed = False
+        try:
+            self.iconbitmap(_resource("icon.ico"))
+        except tk.TclError:
+            pass
+        body = tk.Frame(self, bg=BG)
+        body.pack(fill="both", expand=True, padx=PAD, pady=PAD)
+        tk.Label(body, text="Rename account", bg=BG, fg=FG,
+                 font=("Segoe UI Semibold", 16), anchor="w").pack(fill="x")
+        tk.Label(body, text=f"Steam login: {account.get('username', '')}", bg=BG, fg=FG_MUTED,
+                 font=("Segoe UI", 10), wraplength=392, justify="left", anchor="w").pack(fill="x", pady=GAP)
+        tk.Label(body, text="DISPLAY NAME", bg=BG, fg=FG_MUTED,
+                 font=("Segoe UI", 9, "bold"), anchor="w").pack(fill="x", pady=(0, GAP))
+        field = RoundedCard(body, 392, fill=FIELD, radius=12, inset=12)
+        field.pack(fill="x")
+        self.alias = tk.Entry(field.inner, width=1, bg=FIELD, fg=FG, insertbackground=FG,
+                              selectbackground=ACCENT_LO, selectforeground="white", relief="flat", bd=0,
+                              font=("Segoe UI", 11))
+        self.alias.pack(fill="x")
+        self.alias.insert(0, (account.get("alias") or "").strip())
+        self.alias.selection_range(0, "end")
+        self.alias.bind("<FocusIn>", lambda _: self._field_focus(field, True))
+        self.alias.bind("<FocusOut>", lambda _: self._field_focus(field, False))
+        field.fit(min_height=46)
+        tk.Label(body, text="Leave blank to use the original account name.", bg=BG, fg=FG_MUTED,
+                 font=("Segoe UI", 9), anchor="w").pack(fill="x", pady=(GAP, 0))
+        self.error = tk.Label(body, text="", bg=BG, fg=ERR, font=("Segoe UI", 9),
+                              wraplength=392, justify="left", anchor="w")
+        self.actions = tk.Frame(body, bg=BG)
+        self.actions.pack(fill="x", pady=(GAP, 0))
+        action_width = (440 - 2 * PAD - GAP) // 2
+        self.save_btn = RoundedButton(self.actions, "Save name", self._submit, min_width=action_width)
+        self.save_btn.pack(side="right")
+        self.cancel_btn = RoundedButton(self.actions, "Cancel", self.close, style="secondary", min_width=action_width)
+        self.cancel_btn.pack(side="right", padx=(0, GAP))
+        self.alias.bind("<Return>", self._submit)
+        self.bind("<Escape>", self.close)
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self._fit(center=True)
+        _use_dark_titlebar(self)
+        self.grab_set()
+        self._focus_job = self.after_idle(self.alias.focus_set)
+
+    def _field_focus(self, field, focused):
+        field._border = ACCENT if focused else BORDER
+        field.fit(min_height=46)
+
+    def _fit(self, center=False):
+        self.update_idletasks()
+        width, height = 440, self.winfo_reqheight()
+        position = ""
+        if center:
+            parent = self.master
+            x = parent.winfo_rootx() + (parent.winfo_width() - width) // 2
+            y = parent.winfo_rooty() + (parent.winfo_height() - height) // 2
+            x = max(0, min(x, self.winfo_screenwidth() - width))
+            y = max(0, min(y, self.winfo_screenheight() - height))
+            position = f"+{x}+{y}"
+        self.geometry(f"{width}x{height}{position}")
+
+    def _submit(self, _=None):
+        try:
+            self._on_save(self.alias.get())
+        except OSError:
+            self.error.configure(text="Could not save the name. Check access to the accounts file and try again.")
+            self.error.pack(before=self.actions, fill="x", pady=(GAP, 0))
+            self._fit()
+            self.alias.focus_set()
+        else:
+            self.close()
+        return "break"
+
+    def close(self, _=None):
+        if not self._closed:
+            self._closed = True
+            self.after_cancel(self._focus_job)
+            self.grab_release()
+            self.destroy()
+            self._on_close()
+        return "break"
 
 
 class DropZone(tk.Canvas):
@@ -343,11 +526,34 @@ class DropZone(tk.Canvas):
         self._on_click = on_click
         self._dnd = dnd
         self._hover = False
+        self._focused = False
+        self._enabled = True
+        self._icons = {}
         self._render()
         self.configure(cursor="hand2")
         self.bind("<Enter>", lambda e: self.set_hover(True))
         self.bind("<Leave>", lambda e: self.set_hover(False))
-        self.bind("<Button-1>", lambda e: self._on_click())
+        self.configure(takefocus=True)
+        self.bind("<Button-1>", self._activate)
+        self.bind("<Return>", self._activate)
+        self.bind("<space>", self._activate)
+        self.bind("<FocusIn>", lambda _: self._focus(True))
+        self.bind("<FocusOut>", lambda _: self._focus(False))
+
+    def _activate(self, _=None):
+        if self._enabled:
+            self.focus_set()
+            self._on_click()
+        return "break"
+
+    def _focus(self, on):
+        self._focused = on
+        self._render()
+
+    def set_enabled(self, on):
+        self._enabled = bool(on)
+        self.configure(cursor="hand2" if on else "arrow", takefocus=bool(on))
+        self._render()
 
     def set_hover(self, on):
         self._hover = bool(on)
@@ -355,32 +561,32 @@ class DropZone(tk.Canvas):
 
     def _render(self):
         self.delete("all")
-        fill = DROP_BG_HI if self._hover else DROP_BG
-        border = ACCENT if self._hover else DROP_BORDER
-        icon = ACCENT if self._hover else "#6f78a0"
-        self.create_polygon(
-            _round_rect(1, 1, self._cw - 1, self._ch - 1, 16),
-            smooth=True, fill=fill, outline=border,
-        )
+        hover = self._hover and self._enabled
+        fill = DROP_BG_HI if hover else DROP_BG
+        border = FG if self._focused and self._enabled else ACCENT if hover else DROP_BORDER
+        icon = ACCENT if hover else FG_FAINT
+        _paint_surface(self, self._cw, self._ch, 16, fill, border)
         cx = self._cw / 2
-        cy = self._ch / 2 - 18
-        self._icon(cx, cy, icon)
+        self._icon(cx, 0, icon)
         line1 = "Drag an .exe here" if self._dnd else "Click to choose an .exe"
-        self.create_text(cx, self._ch / 2 + 20, text=line1, fill=FG, font=("Segoe UI", 12))
+        self.create_text(cx, 0, text=line1, fill=FG, font=("Segoe UI", 12), tags="drop-title")
         self.create_text(
-            cx, self._ch / 2 + 42, text="or click to browse",
-            fill=FG_MUTED, font=("Segoe UI", 10),
+            cx, 0, text="or click to browse" if self._dnd else "Browse for an executable file",
+            fill=FG_MUTED, font=("Segoe UI", 10), tags="drop-hint",
         )
+        cursor = 0
+        for tag in ("drop-icon", "drop-title", "drop-hint"):
+            _, top, _, bottom = self.bbox(tag)
+            self.move(tag, 0, cursor - top)
+            cursor += bottom - top + GAP
+        offset = (self._ch - (cursor - GAP)) / 2
+        for tag in ("drop-icon", "drop-title", "drop-hint"):
+            self.move(tag, 0, offset)
 
     def _icon(self, cx, cy, color):
-        # A "download into a tray" glyph: arrow above an open-top box.
-        w = 2
-        self.create_line(cx, cy - 14, cx, cy + 8, fill=color, width=w, capstyle="round")
-        self.create_line(cx - 7, cy + 1, cx, cy + 8, fill=color, width=w, capstyle="round")
-        self.create_line(cx + 7, cy + 1, cx, cy + 8, fill=color, width=w, capstyle="round")
-        self.create_line(cx - 14, cy + 7, cx - 14, cy + 17, fill=color, width=w, capstyle="round")
-        self.create_line(cx - 14, cy + 17, cx + 14, cy + 17, fill=color, width=w, capstyle="round")
-        self.create_line(cx + 14, cy + 17, cx + 14, cy + 7, fill=color, width=w, capstyle="round")
+        if color not in self._icons:
+            self._icons[color] = tk.PhotoImage(master=self, data=DROP_ICONS[color])
+        self.create_image(cx, cy, image=self._icons[color], tags="drop-icon")
 
 
 def _resource(name):
@@ -410,15 +616,9 @@ def _use_dark_titlebar(root):
 
 
 def _draw_logo(canvas, s):
-    """A rounded accent tile with a white 'extract' mark (arrow onto a baseline)."""
-    canvas.create_polygon(
-        _round_rect(1, 1, s - 1, s - 1, s * 0.28), smooth=True, fill=ACCENT, outline=ACCENT
-    )
-    cx = s / 2
-    canvas.create_line(cx, s * 0.26, cx, s * 0.60, fill="white", width=2.4, capstyle="round")
-    canvas.create_line(cx - 6, s * 0.46, cx, s * 0.60, fill="white", width=2.4, capstyle="round")
-    canvas.create_line(cx + 6, s * 0.46, cx, s * 0.60, fill="white", width=2.4, capstyle="round")
-    canvas.create_line(s * 0.30, s * 0.72, s * 0.70, s * 0.72, fill="white", width=2.4, capstyle="round")
+    """Render the same supersampled mark used by the executable icon."""
+    canvas._logo_image = tk.PhotoImage(master=canvas, data=LOGO_IMAGE)
+    canvas.create_image(s / 2, s / 2, image=canvas._logo_image)
 
 
 class App:
@@ -434,24 +634,39 @@ class App:
 
         self.result_text = ""  # the current "name----token" string
         self.store = Store()  # saved accounts (tokens + aliases) on disk
+        self.private_login = self.store.preferences["private_login"]
+        self.disable_cloud_sync = self.store.preferences["disable_cloud_sync"]
+        self.use_cs2_launch_options = self.store.preferences["use_cs2_launch_options"]
         self.current_account = None  # the saved account currently shown, if any
         self._picker = None  # the open account-picker popup, if any
         self._picker_closed_at = 0.0
         self._token_dialog = None
+        self._rename_dialog = None
         self._login_thread = None
         self._login_cancel = threading.Event()
         self._login_events = queue.Queue()
         self._closing = False
+        self._cooldown_check = None
+        self._cooldown_poll_job = None
+        self._cooldown_notice = {}
+        self._detail_rows = []
+        self.cooldown_btn = None
+        self._steam_session_seen = None
+        self._steam_watch_job = None
 
         self._build_ui()
         self._fit_and_center()  # size the window to its content, then centre
         _use_dark_titlebar(root)
 
         # Keyboard: Ctrl+C copies the result, Esc closes the window.
-        root.bind("<Control-c>", lambda e: self._copy())
+        root.bind("<Control-c>", lambda e: self._copy() if e.widget is not self.cs2_launch_options_entry else None)
         root.bind("<Escape>", self._request_close)
         root.protocol("WM_DELETE_WINDOW", self._request_close)
         root.bind("<MouseWheel>", self._scroll_content)
+        root.bind("<Control-Tab>", self._cycle_tab)
+        root.bind("<Control-Shift-Tab>", self._cycle_tab)
+        root.bind("<Destroy>", self._stop_steam_watch, add="+")
+        self._steam_watch_job = root.after(1500, self._watch_steam_session)
 
         if _DND_AVAILABLE:
             self.drop.drop_target_register(DND_FILES)
@@ -460,9 +675,9 @@ class App:
             self.drop.dnd_bind("<<DragLeave>>", lambda e: self.drop.set_hover(False))
 
     # -- layout --------------------------------------------------------------
-    def _section(self, text):
+    def _section(self, text, parent=None):
         return tk.Label(
-            self.content, text=text, bg=BG, fg=FG_FAINT,
+            parent if parent is not None else self.content, text=text, bg=BG, fg=FG_FAINT,
             font=("Segoe UI", 9, "bold"), anchor="w",
         )
 
@@ -471,40 +686,52 @@ class App:
         self.viewport = tk.Canvas(self.root, width=WIN_W, bg=BG, bd=0, highlightthickness=0)
         self.viewport.pack(fill="both", expand=True)
         self.content = tk.Frame(self.viewport, bg=BG)
-        self.viewport.create_window(0, 0, window=self.content, anchor="nw", width=WIN_W)
+        self.settings_content = tk.Frame(self.viewport, bg=BG)
+        self._pages = {"accounts": self.content, "settings": self.settings_content}
+        self.active_tab = "accounts"
+        self._tab_scroll = {"accounts": 0.0, "settings": 0.0}
+        self._content_window = self.viewport.create_window(0, 0, window=self.content, anchor="nw", width=WIN_W)
         self.scrollbar = tk.Canvas(self.viewport, bg=BG, bd=0, highlightthickness=0, cursor="hand2")
         self.viewport.configure(yscrollcommand=self._update_scrollbar)
         self.viewport.bind("<Configure>", lambda _: self._update_scrollbar(*self.viewport.yview()))
         self.scrollbar.bind("<Button-1>", self._drag_scrollbar)
         self.scrollbar.bind("<B1-Motion>", self._drag_scrollbar)
 
-        # header: logo tile + title/subtitle
-        header = tk.Frame(self.content, bg=BG)
-        header.pack(fill="x", padx=PAD, pady=(24, 0))
+        # Compact navigation in the upper-left corner, above the app header.
+        toolbar = tk.Frame(self.root, bg=BG)
+        toolbar.pack(before=self.viewport, fill="x", padx=PAD, pady=(PAD, 0))
+        self.settings_btn = NavigationButton(toolbar, self._cycle_tab)
+        self.settings_btn.pack(side="left")
+        self.settings_btn.bind("<Left>", lambda _: self._select_tab("accounts"))
+        self.settings_btn.bind("<Right>", lambda _: self._select_tab("settings"))
 
+        # header: logo tile + title/subtitle
+        header = tk.Frame(self.root, bg=BG)
+        header.pack(before=self.viewport, fill="x", padx=PAD, pady=(GAP, 0))
         logo = tk.Canvas(header, width=46, height=46, bg=BG, highlightthickness=0, bd=0)
         logo.pack(side="left")
         _draw_logo(logo, 46)
 
         titles = tk.Frame(header, bg=BG)
-        titles.pack(side="left", padx=(14, 0))
+        titles.pack(side="left", padx=(GAP, 0))
         tk.Label(
             titles, text=APP_TITLE, bg=BG, fg=FG, font=("Segoe UI Semibold", 19)
         ).pack(anchor="w")
-        tk.Label(
+        self.subtitle = tk.Label(
             titles, text="Extract or paste a token, then log in.",
             bg=BG, fg=FG_MUTED, font=("Segoe UI", 10),
-        ).pack(anchor="w", pady=(1, 0))
+        )
+        self.subtitle.pack(anchor="w", pady=(GAP, 0))
         self.paste_btn = RoundedButton(header, "Paste token", self._open_token_dialog,
-                                       style="secondary", min_width=132, pad_x=14)
-        self.paste_btn.pack(side="right", pady=(3, 0))
+                                       style="secondary", min_width=132, pad_x=GAP)
+        self.paste_btn.pack(side="right")
 
         # drop zone
         self.drop = DropZone(self.content, CONTENT_W, 130, self._browse, dnd=_DND_AVAILABLE)
-        self.drop.pack(padx=PAD, pady=(18, 0))
+        self.drop.pack(padx=PAD, pady=(GAP, 0))
 
         # saved accounts — pick one you've pulled before
-        self._section("SAVED ACCOUNTS").pack(fill="x", padx=PAD, pady=(20, 7))
+        self._section("SAVED ACCOUNTS").pack(fill="x", padx=PAD, pady=GAP)
         self.saved_btn = RoundedButton(
             self.content, self._saved_btn_text(), self._toggle_picker,
             style="secondary", min_width=CONTENT_W,
@@ -513,44 +740,139 @@ class App:
 
         # Steam config backup/restore is intentionally disabled pending redesign.
 
+        self._build_settings()
+
         # result
-        self._section("RESULT").pack(fill="x", padx=PAD, pady=(22, 7))
-        self.result_card = RoundedCard(self.content, CONTENT_W, fill=FIELD, border=BORDER)
+        self._section("RESULT").pack(fill="x", padx=PAD, pady=GAP)
+        self.result_card = RoundedCard(self.content, CONTENT_W, fill=FIELD, border=BORDER, inset=GAP)
         self.result_card.pack(padx=PAD)
-        self._text_padx = 4
+        self._text_padx = 0
         self.output = tk.Text(
             self.result_card.inner, height=2, wrap="char", bg=FIELD, fg=FG,
             insertbackground=FG, relief="flat", highlightthickness=0, bd=0,
-            font=self._mono, padx=self._text_padx, pady=2,
+            font=self._mono, padx=self._text_padx, pady=0,
         )
         self.output.pack(fill="x")
 
         # details (decoded claims)
-        self._section("DETAILS").pack(fill="x", padx=PAD, pady=(18, 7))
-        self.details_card = RoundedCard(self.content, CONTENT_W, fill=SURFACE, border=BORDER)
+        self._section("DETAILS").pack(fill="x", padx=PAD, pady=GAP)
+        self.details_card = RoundedCard(self.content, CONTENT_W, fill=SURFACE, border=BORDER, inset=GAP)
         self.details_card.pack(padx=PAD)
         self.details_inner = self.details_card.inner
 
         # footer: actions above a wrapping status line
-        footer = tk.Frame(self.root, bg=BG)
-        footer.pack(side="bottom", before=self.viewport, fill="x", padx=PAD, pady=(20, 24))
-        actions = tk.Frame(footer, bg=BG)
+        self.footer = footer = tk.Frame(self.root, bg=BG)
+        footer.pack(side="bottom", before=self.viewport, fill="x", padx=PAD, pady=(GAP, PAD))
+        self.actions = actions = tk.Frame(footer, bg=BG)
         actions.pack(fill="x")
 
-        self.copy_btn = RoundedButton(actions, "Copy", self._copy, style="secondary", min_width=104)
+        action_width = (CONTENT_W - GAP) // 2
+        self.copy_btn = RoundedButton(actions, "Copy", self._copy, style="secondary", min_width=action_width)
         self.copy_btn.pack(side="left")
         self.copy_btn.set_enabled(False)
-        self.login_btn = RoundedButton(actions, "Log in to Steam", self._login_to_steam, min_width=160)
-        self.login_btn.pack(side="left", padx=(10, 0))
+        self.login_btn = RoundedButton(actions, "Log in to Steam", self._login_to_steam, min_width=action_width)
+        self.login_btn.pack(side="left", padx=(GAP, 0))
         self.login_btn.set_enabled(False)
 
         self.status = tk.Label(footer, text="", bg=BG, fg=FG_MUTED, font=("Segoe UI", 9),
                                wraplength=CONTENT_W, justify="left", anchor="w")
-        self.status.pack(fill="x", pady=(10, 0))
 
         # initial (empty) content — also sizes the two cards to their placeholders
         self._set_output("")
         self._set_details([])
+
+    def _build_settings(self):
+        tk.Label(self.settings_content, text="Settings", bg=BG, fg=FG,
+                 font=("Segoe UI Semibold", 17), anchor="w").pack(fill="x", padx=PAD, pady=(GAP, 0))
+        tk.Label(self.settings_content, text="Saved automatically. Applies to every account you log in to.",
+                 bg=BG, fg=FG_MUTED, font=("Segoe UI", 10), anchor="w",
+                 wraplength=CONTENT_W, justify="left").pack(fill="x", padx=PAD, pady=(GAP, 0))
+        option_heading = self._section("LOGIN OPTIONS", self.settings_content)
+        option_heading.configure(fg=FG_MUTED)
+        option_heading.pack(fill="x", padx=PAD, pady=GAP)
+        self.login_options_card = RoundedCard(self.settings_content, CONTENT_W, fill=SURFACE, border=BORDER,
+                                             radius=20, inset=GAP)
+        self.login_options_card.pack(padx=PAD)
+        for index, (name, title, description, command) in enumerate((
+            ("private_login", "Appear offline & disable Remote Play",
+             "Every login while enabled. Steam stays connected.", self._toggle_private_login),
+            ("disable_cloud_sync", "Disable Steam Cloud Sync",
+             "Before every login. Game saves stay on this PC.", self._toggle_disable_cloud_sync),
+        )):
+            row = tk.Frame(self.login_options_card.inner, bg=SURFACE)
+            row.pack(fill="x", pady=(0, GAP) if index == 0 else 0)
+            button = ToggleSwitch(row, getattr(self, name), command)
+            button.set_enabled(os.name == "nt")
+            button.pack(side="right", padx=(GAP, 0))
+            setattr(self, name + "_btn", button)
+            text = tk.Frame(row, bg=SURFACE)
+            text.pack(side="left", fill="x", expand=True)
+            tk.Label(text, text=title, bg=SURFACE, fg=FG,
+                     font=("Segoe UI Semibold", 10)).pack(anchor="w")
+            tk.Label(text, text=description, bg=SURFACE, fg=FG_MUTED,
+                     font=("Segoe UI", 9)).pack(anchor="w", pady=(GAP, 0))
+        self.login_options_card.fit()
+        tk.Label(self.settings_content, text="Turning an option off leaves Steam’s current settings in place.",
+                 bg=BG, fg=FG_FAINT, font=("Segoe UI", 9), wraplength=CONTENT_W,
+                 justify="left", anchor="w").pack(fill="x", padx=PAD, pady=(GAP, 0))
+
+        self._section("CS2 LAUNCH OPTIONS", self.settings_content).pack(fill="x", padx=PAD, pady=GAP)
+        self.cs2_options_card = RoundedCard(self.settings_content, CONTENT_W, fill=SURFACE,
+                                           border=BORDER, radius=20, inset=GAP)
+        self.cs2_options_card.pack(padx=PAD)
+        row = tk.Frame(self.cs2_options_card.inner, bg=SURFACE)
+        row.pack(fill="x")
+        self.use_cs2_launch_options_btn = ToggleSwitch(row, self.use_cs2_launch_options,
+                                                     self._toggle_use_cs2_launch_options)
+        self.use_cs2_launch_options_btn.set_enabled(os.name == "nt")
+        self.use_cs2_launch_options_btn.pack(side="right", padx=(GAP, 0))
+        tk.Label(row, text="Use custom launch options", bg=SURFACE, fg=FG,
+                 font=("Segoe UI Semibold", 10)).pack(side="left")
+        tk.Label(self.cs2_options_card.inner, text="Replaces CS2 launch options for the selected account at login.",
+                 bg=SURFACE, fg=FG_MUTED, font=("Segoe UI", 9), wraplength=CONTENT_W - 2 * GAP,
+                 anchor="w", justify="left").pack(fill="x", pady=(GAP, 0))
+        self.cs2_options_field = RoundedCard(self.cs2_options_card.inner, CONTENT_W - 2 * GAP,
+                                            fill=FIELD, border=BORDER, radius=12, inset=GAP)
+        self.cs2_options_field.pack(fill="x", pady=(GAP, 0))
+        self.cs2_launch_options_entry = tk.Entry(self.cs2_options_field.inner, bg=FIELD, fg=FG,
+                                                insertbackground=FG, selectbackground=ACCENT_LO,
+                                                disabledbackground=FIELD, disabledforeground=FG_FAINT,
+                                                font=("Consolas", 10), relief="flat", bd=0)
+        self.cs2_launch_options_entry.pack(fill="x")
+        self.cs2_launch_options_entry.insert(0, self.store.preferences["cs2_launch_options"])
+        self.cs2_launch_options_entry.bind("<FocusIn>", lambda _: self._focus_cs2_options(True))
+        self.cs2_launch_options_entry.bind("<FocusOut>", lambda _: self._save_cs2_launch_options())
+        self.cs2_launch_options_entry.bind("<Return>", self._save_cs2_launch_options_on_enter)
+        self.cs2_options_field.fit()
+        tk.Label(self.cs2_options_card.inner, text="Blank clears CS2 options when enabled. Off leaves Steam’s options alone.",
+                 bg=SURFACE, fg=FG_MUTED, font=("Segoe UI", 9), wraplength=CONTENT_W - 2 * GAP,
+                 anchor="w", justify="left").pack(fill="x", pady=(GAP, 0))
+        self.cs2_options_status = tk.Label(self.cs2_options_card.inner, text="Saved when you leave the field or press Enter.",
+                                         bg=SURFACE, fg=FG_FAINT, font=("Segoe UI", 9),
+                                         anchor="w", justify="left", wraplength=CONTENT_W - 2 * GAP)
+        self.cs2_options_status.pack(fill="x", pady=(GAP, 0))
+        self.cs2_options_card.fit()
+
+    def _select_tab(self, name):
+        if name == self.active_tab:
+            return "break"
+        if not self._save_cs2_launch_options():
+            return "break"
+        self._close_picker()
+        self._tab_scroll[self.active_tab] = self.viewport.yview()[0]
+        self.active_tab = name
+        self.viewport.itemconfigure(self._content_window, window=self._pages[name])
+        self.settings_btn.set_destination("accounts" if name == "settings" else "settings")
+        self.subtitle.configure(text="Manage your login preferences." if name == "settings"
+                                else "Extract or paste a token, then log in.")
+        self._refresh_login_action()
+        self._refit()
+        self.viewport.yview_moveto(self._tab_scroll[name])
+        self.settings_btn.focus_set()
+        return "break"
+
+    def _cycle_tab(self, _=None):
+        return self._select_tab("settings" if self.active_tab == "accounts" else "accounts")
 
     # -- behaviour -----------------------------------------------------------
     def _on_drop(self, event):
@@ -663,7 +985,7 @@ class App:
         accounts = self.store.ordered()
         self.root.update_idletasks()
         x = self.saved_btn.winfo_rootx()
-        y = self.saved_btn.winfo_rooty() + self.saved_btn.winfo_height() + 4
+        y = self.saved_btn.winfo_rooty() + self.saved_btn.winfo_height() + GAP
         width = self.saved_btn.winfo_width()
 
         top = tk.Toplevel(self.root, bg=BORDER_HI)  # bg shows as a 1px border
@@ -678,8 +1000,8 @@ class App:
             tk.Label(
                 body, text="No saved accounts yet.\nExtract a token and it's kept here.",
                 bg=SURFACE, fg=FG_MUTED, font=("Segoe UI", 10),
-                justify="left", padx=16, pady=16,
-            ).pack(anchor="w")
+                justify="left", padx=GAP, pady=GAP,
+            ).pack(fill="x", anchor="w")
         else:
             canvas = tk.Canvas(body, bg=SURFACE, highlightthickness=0, bd=0)
             inner = tk.Frame(canvas, bg=SURFACE)
@@ -689,27 +1011,37 @@ class App:
                 self._build_account_row(inner, acc)
             inner.update_idletasks()
             content_h = inner.winfo_reqheight()
-            view_h = min(content_h, 6 * 58)  # show ~6 rows, then scroll
+            view_h = min(content_h, 6 * 80, max(80, self.root.winfo_screenheight() - y - 80))
             canvas.configure(height=view_h, scrollregion=(0, 0, width - 2, content_h))
             if content_h > view_h:
-                canvas.bind_all(
+                top.bind(
                     "<MouseWheel>",
                     lambda e: (canvas.yview_scroll(-1 if e.delta > 0 else 1, "units"), "break")[1],
                 )
-                top.bind("<Destroy>", lambda e: canvas.unbind_all("<MouseWheel>"))
 
         top.update_idletasks()
-        top.geometry(f"{width}x{top.winfo_reqheight()}+{x}+{y}")
+        height = top.winfo_reqheight()
+        x = max(0, min(x, top.winfo_screenwidth() - width))
+        y = max(0, min(y, top.winfo_screenheight() - height - PAD))
+        top.geometry(f"{width}x{height}+{x}+{y}")
         top.bind("<Escape>", self._close_picker)
         top.focus_force()
-        top.bind("<FocusOut>", self._close_picker)
+        def dismiss_if_outside():
+            if self._picker is not top:
+                return
+            focused = top.focus_get()
+            if focused is None or (focused is not top and not str(focused).startswith(str(top) + ".")):
+                self._close_picker()
+        top.bind("<FocusOut>", lambda _: self.root.after_idle(dismiss_if_outside))
+        if accounts:
+            top.after_idle(lambda: inner.winfo_children()[0].focus_set() if self._picker is top else None)
 
     def _build_account_row(self, parent, acc):
-        row = tk.Frame(parent, bg=SURFACE)
+        row = tk.Frame(parent, bg=SURFACE, takefocus=True)
         row.pack(fill="x")
 
         text = tk.Frame(row, bg=SURFACE)
-        text.pack(side="left", fill="x", expand=True, padx=(14, 8), pady=8)
+        text.pack(side="left", fill="x", expand=True, padx=(GAP, 0), pady=GAP)
         name_lbl = tk.Label(
             text, text=account_label(acc), bg=SURFACE, fg=FG,
             font=("Segoe UI Semibold", 11), anchor="w",
@@ -724,15 +1056,15 @@ class App:
             text, text="  ·  ".join(parts) or "—", bg=SURFACE, fg=FG_MUTED,
             font=("Segoe UI", 9), anchor="w",
         )
-        sub_lbl.pack(anchor="w", pady=(1, 0))
+        sub_lbl.pack(anchor="w", pady=(GAP, 0))
 
         actions = tk.Frame(row, bg=SURFACE)
-        actions.pack(side="right", padx=(8, 12))
+        actions.pack(side="right", padx=GAP)
         rename_lbl = tk.Label(actions, text="Rename", bg=SURFACE, fg=FG_MUTED,
-                              font=("Segoe UI", 9), cursor="hand2")
-        rename_lbl.pack(side="left", padx=(0, 10))
+                              font=("Segoe UI", 9), cursor="hand2", takefocus=True)
+        rename_lbl.pack(side="left", padx=(0, GAP))
         del_lbl = tk.Label(actions, text="Delete", bg=SURFACE, fg=FG_MUTED,
-                           font=("Segoe UI", 9), cursor="hand2")
+                           font=("Segoe UI", 9), cursor="hand2", takefocus=True)
         del_lbl.pack(side="left")
 
         tk.Frame(parent, bg=BORDER, height=1).pack(fill="x")  # hairline divider
@@ -759,8 +1091,17 @@ class App:
             w.bind("<Leave>", lambda e: parent.after_idle(_refresh_hover), add="+")
         for w in (row, text, name_lbl, sub_lbl):
             w.bind("<Button-1>", lambda e, a=acc: self._use_account(a))
+        row.bind("<Return>", lambda e: (self._use_account(acc), "break")[1])
+        row.bind("<space>", lambda e: (self._use_account(acc), "break")[1])
+        row.bind("<FocusIn>", lambda _: name_lbl.configure(fg=ACCENT_HI))
+        row.bind("<FocusOut>", lambda _: name_lbl.configure(fg=FG))
         rename_lbl.bind("<Button-1>", lambda e, a=acc: self._rename_account(a))
         del_lbl.bind("<Button-1>", lambda e, a=acc: self._delete_account(a))
+        for widget, action in ((rename_lbl, self._rename_account), (del_lbl, self._delete_account)):
+            widget.bind("<Return>", lambda e, action=action: (action(acc), "break")[1])
+            widget.bind("<space>", lambda e, action=action: (action(acc), "break")[1])
+            widget.bind("<FocusIn>", lambda e: e.widget.configure(fg=ACCENT_HI))
+            widget.bind("<FocusOut>", lambda e: e.widget.configure(fg=FG_MUTED))
         for w in (rename_lbl, del_lbl):
             w.bind("<Enter>", lambda e, ww=w: ww.configure(fg=FG), add="+")
             w.bind("<Leave>", lambda e, ww=w: ww.configure(fg=FG_MUTED), add="+")
@@ -777,22 +1118,33 @@ class App:
         self._set_details(summarize_claims(payload))
         self.current_account = acc
         self._refresh_login_action()
-        self.store.touch(acc["id"])
+        try:
+            self.store.touch(acc["id"])
+        except OSError:
+            self._set_status(f"Loaded {account_label(acc)}. Could not save the last-used order.", ERR)
+            self._copy(announce=False)
+            return
         self._refresh_saved()
         self._refit()
         self._copy(announce=False)
         self._set_status(f"Loaded {account_label(acc)} — copied", OK)
 
     def _rename_account(self, acc):
+        if self._login_thread is not None:
+            return
+        if self._rename_dialog is not None:
+            self._rename_dialog.lift()
+            self._rename_dialog.alias.focus_set()
+            return
         self._close_picker()
-        alias = simpledialog.askstring(
-            "Rename account",
-            f"Alias for “{acc.get('username')}”\n(leave blank to clear):",
-            initialvalue=(acc.get("alias") or "").strip(), parent=self.root,
-        )
-        if alias is not None:  # None means the dialog was cancelled
+        self.current_account = acc
+        def save(alias):
             self.store.set_alias(acc["id"], alias)
             self._refresh_saved()
+        self._rename_dialog = RenameDialog(self.root, acc, save, self._rename_dialog_closed)
+
+    def _rename_dialog_closed(self):
+        self._rename_dialog = None
         self._open_picker()
 
     def _delete_account(self, acc):
@@ -804,14 +1156,74 @@ class App:
             "account itself.",
             parent=self.root, icon="warning",
         ):
-            self.store.remove(acc["id"])
+            try:
+                self.store.remove(acc["id"])
+            except OSError:
+                self._set_status("Could not delete the saved account. Check access to the accounts file.", ERR)
+                self._open_picker()
+                return
             if self.current_account and self.current_account.get("id") == acc["id"]:
                 self.current_account = None
+                self._set_output("")
+                self._set_details([])
                 self._refresh_login_action()
             self._refresh_saved()
         self._open_picker()
 
     # -- Steam login ---------------------------------------------------------
+    def _toggle_private_login(self):
+        self._toggle_login_option("private_login", self.private_login_btn, self.store.set_private_login)
+
+    def _toggle_disable_cloud_sync(self):
+        self._toggle_login_option("disable_cloud_sync", self.disable_cloud_sync_btn, self.store.set_disable_cloud_sync)
+
+    def _toggle_use_cs2_launch_options(self):
+        if self._login_thread is None and self._save_cs2_launch_options():
+            self._toggle_login_option("use_cs2_launch_options", self.use_cs2_launch_options_btn,
+                                      self.store.set_use_cs2_launch_options)
+
+    def _save_cs2_launch_options_on_enter(self, _=None):
+        self._save_cs2_launch_options()
+        return "break"
+
+    def _focus_cs2_options(self, focused):
+        if self.cs2_options_field._border != ERR:
+            self.cs2_options_field._border = ACCENT if focused else BORDER
+            self.cs2_options_field.fit()
+
+    def _save_cs2_launch_options(self):
+        if self._login_thread is not None:
+            return True
+        options = self.cs2_launch_options_entry.get()
+        try:
+            if options != self.store.preferences["cs2_launch_options"]:
+                self.store.set_cs2_launch_options(options)
+        except (OSError, SteamLoginError) as exc:
+            message = str(exc) if isinstance(exc, SteamLoginError) else "Could not save. Check access to the accounts file."
+            self.cs2_options_status.configure(text=message, fg=ERR)
+            self.cs2_options_field._border = ERR
+            saved = False
+        else:
+            self.cs2_options_status.configure(text="Saved. Applies on your next login when enabled.", fg=FG_FAINT)
+            self.cs2_options_field._border = ACCENT if self.root.focus_get() is self.cs2_launch_options_entry else BORDER
+            saved = True
+        self.cs2_options_field.fit()
+        self.cs2_options_card.fit()
+        self._refit()
+        return saved
+
+    def _toggle_login_option(self, name, button, save):
+        if self._login_thread is not None:
+            return
+        try:
+            save(not getattr(self, name))
+        except OSError:
+            self._set_status("Could not save the login option. Please check access to the accounts file.", ERR)
+            self._refit()
+            return
+        setattr(self, name, self.store.preferences[name])
+        button.set_checked(getattr(self, name))
+
     def _refresh_login_action(self):
         busy = self._login_thread is not None
         self.login_btn.set_text("Cancel login" if busy else "Log in to Steam")
@@ -819,6 +1231,35 @@ class App:
         self.saved_btn.set_enabled(not busy)
         self.paste_btn.set_enabled(not busy)
         self.copy_btn.set_enabled(bool(self.result_text) and not busy)
+        self.drop.set_enabled(not busy)
+        self.private_login_btn.set_enabled(not busy and os.name == "nt")
+        self.disable_cloud_sync_btn.set_enabled(not busy and os.name == "nt")
+        self.use_cs2_launch_options_btn.set_enabled(not busy and os.name == "nt")
+        self.cs2_launch_options_entry.configure(state="disabled" if busy else "normal")
+        if self.cooldown_btn is not None and self.cooldown_btn.winfo_exists():
+            self.cooldown_btn.set_enabled(not busy)
+        if self.active_tab == "accounts":
+            self.paste_btn.pack(side="right")
+        else:
+            self.paste_btn.pack_forget()
+        # Keep cancellation accessible when viewing Settings during a login.
+        if self.active_tab == "accounts" or busy:
+            self.actions.pack(fill="x", **({"before": self.status} if self.status.winfo_manager() else {}))
+        else:
+            self.actions.pack_forget()
+        self._fit_footer_spacing()
+
+    def _fit_footer_spacing(self):
+        has_actions = bool(self.actions.winfo_manager())
+        if self.status.winfo_manager():
+            self.status.pack_configure(pady=(GAP if has_actions else 0, 0))
+        has_content = has_actions or bool(self.status.winfo_manager())
+        if has_content:
+            self.footer.pack(side="bottom", before=self.viewport, fill="x", padx=PAD, pady=(GAP, PAD))
+        else:
+            # Empty Tk frames retain their previous requested height. Hide the
+            # footer so Settings does not inherit a blank actions-sized gap.
+            self.footer.pack_forget()
 
     def _login_to_steam(self):
         if self._login_thread is not None:
@@ -837,18 +1278,27 @@ class App:
             self._set_status(str(exc), ERR)
             self._refit()
             return
+        if not self._save_cs2_launch_options():
+            self._select_tab("settings")
+            return
+        self._stop_cooldown_check()
+        self._refresh_cooldown_details()
         self._close_picker()
         self._login_cancel.clear()
-        self._login_thread = threading.Thread(target=self._login_worker, args=(account,), name="Steam login")
+        cs2_options = self.store.preferences["cs2_launch_options"] if self.use_cs2_launch_options else None
+        self._login_thread = threading.Thread(target=self._login_worker,
+                                              args=(account, self.private_login, self.disable_cloud_sync, cs2_options), name="Steam login")
         self._refresh_login_action()
         self._set_status("Preparing Steam login…")
         self._login_thread.start()
         self.root.after(80, self._drain_login_events)
 
-    def _login_worker(self, account):
+    def _login_worker(self, account, private_login=False, disable_cloud_sync=False, cs2_launch_options=None):
         try:
             result = login_account(account["username"], account["token"], cancel=self._login_cancel,
-                                   progress=lambda message: self._login_events.put(("progress", message)))
+                                   progress=lambda message: self._login_events.put(("progress", message)),
+                                   private_login=private_login, disable_cloud_sync=disable_cloud_sync,
+                                   cs2_launch_options=cs2_launch_options)
             self._login_events.put(("done", result))
         except LoginCancelled as exc:
             self._login_events.put(("cancelled", str(exc)))
@@ -876,16 +1326,23 @@ class App:
                 sign_in = value.get("sign_in", "unconfirmed")
                 count = value["preserved_accounts"]
                 preserved = f"Kept {count} other remembered account{'s' if count != 1 else ''}."
+                cloud = " Steam Cloud Sync off configured." if value.get("disable_cloud_sync") else ""
+                if value.get("cs2_launch_options_applied"):
+                    cloud += " CS2 launch options configured."
                 if sign_in == "rejected":
                     self._set_status(f"Steam rejected sign-in: {value.get('reason') or 'Login rejected'}. Check the session with the account owner.", ERR)
                 elif sign_in == "other_account":
                     self._set_status("Steam signed in to a different account. Select the account you added in Steam.", "#facc15")
                 elif sign_in == "confirmed":
-                    self._set_status(f"Signed in to Steam. {preserved}", OK)
+                    options = " Invisible status and Remote Play off configured." if value.get("private_login") else ""
+                    self._set_status(f"Signed in to Steam.{options}{cloud} {preserved}", OK)
+                    steam_id = value.get("steam_id")
+                    if steam_id:
+                        self._check_cooldown(steam_id, automatic=True)
                 elif value.get("warning"):
-                    self._set_status(f"Steam launched. {value['warning']}", "#facc15")
+                    self._set_status(f"Steam launched.{cloud} {value['warning']}", "#facc15")
                 else:
-                    self._set_status(f"Steam launched; sign-in wasn't confirmed. Check the client. {preserved}", FG_MUTED)
+                    self._set_status(f"Steam launched; sign-in wasn't confirmed.{cloud} Check the client. {preserved}", FG_MUTED)
             else:
                 self._set_status(value, FG_MUTED if kind == "cancelled" else ERR)
             self._refit()
@@ -893,13 +1350,15 @@ class App:
             self.root.after(80, self._drain_login_events)
 
     def _request_close(self, *_):
+        self._stop_cooldown_check()
         if self._login_thread is not None:
             self._closing = True
             self._login_cancel.set()
             self.login_btn.set_enabled(False)
             self._set_status("Cancelling Steam login before closing…")
             return
-        self.root.destroy()
+        if self._save_cs2_launch_options():
+            self.root.destroy()
 
     # -- output helpers ------------------------------------------------------
     def _set_output(self, text: str):
@@ -929,18 +1388,21 @@ class App:
         avail = CONTENT_W - 2 * self.result_card.inset - 2 * self._text_padx - 2
         per_line = max(1, int(avail // char_w))
         lines = (len(text) + per_line - 1) // per_line  # ceil division
-        self.output.configure(height=max(2, min(lines, 12)))
+        self.output.configure(height=max(1, min(lines, 12)))
         self.result_card.fit()
 
     def _set_details(self, rows: list[tuple[str, str]]):
+        self._detail_rows = rows
         for child in self.details_inner.winfo_children():
             child.destroy()
+        self.details_inner.columnconfigure(0, weight=0)
+        self.details_inner.columnconfigure(1, weight=1)
         if not rows:
             tk.Label(
                 self.details_inner,
                 text="Token claims (issuer, expiry, …) will appear here.",
-                bg=SURFACE, fg=FG_FAINT, font=("Segoe UI", 10),
-            ).grid(row=0, column=0, sticky="w")
+                bg=SURFACE, fg=FG_FAINT, font=("Segoe UI", 10), anchor="w",
+            ).grid(row=0, column=0, columnspan=2, sticky="ew")
         else:
             _WARN_LABELS = {"Status", "Revoked if", "Note"}
             for i, (label, value) in enumerate(rows):
@@ -955,13 +1417,157 @@ class App:
                 tk.Label(
                     self.details_inner, text=label, bg=SURFACE, fg=FG_MUTED,
                     font=("Segoe UI", 10),
-                ).grid(row=i, column=0, sticky="nw", padx=(0, 18), pady=2)
+                ).grid(row=i, column=0, sticky="nw", padx=(0, GAP),
+                       pady=(0, GAP) if i < len(rows) - 1 else 0)
                 tk.Label(
                     self.details_inner, text=value, bg=SURFACE, fg=val_fg,
                     font=("Segoe UI Semibold", 10),
-                    wraplength=350, justify="left",
-                ).grid(row=i, column=1, sticky="w", pady=2)
-        self.details_card.fit(min_height=44)
+                    wraplength=350, justify="left", anchor="w",
+                ).grid(row=i, column=1, sticky="ew",
+                       pady=(0, GAP) if i < len(rows) - 1 else 0)
+        self._build_cooldown_details(len(rows) if rows else 1)
+        self.details_card.fit()
+
+    def _current_steam_id(self):
+        if self.current_account is None:
+            return None
+        try:
+            payload = decode_token(self.current_account["token"]).get("payload")
+            steam_id = payload.get("sub") if isinstance(payload, dict) else None
+        except (ExtractionError, KeyError):
+            return None
+        return steam_id if isinstance(steam_id, str) and re.fullmatch(r"[0-9]{17}", steam_id) else None
+
+    def _build_cooldown_details(self, row):
+        steam_id = self._current_steam_id()
+        if steam_id is None:
+            return
+        panel = tk.Frame(self.details_inner, bg=SURFACE)
+        panel.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(GAP, 0))
+        tk.Frame(panel, bg=BORDER, height=1).pack(fill="x", pady=(0, GAP))
+        heading = tk.Frame(panel, bg=SURFACE)
+        heading.pack(fill="x")
+        tk.Label(heading, text="CS2 matchmaking cooldown", bg=SURFACE, fg=FG,
+                 font=("Segoe UI Semibold", 10)).pack(side="left")
+        checking = self._cooldown_check is not None
+        self.cooldown_btn = button = RoundedButton(heading, "Cancel check" if checking else "Refresh data",
+                               self._check_cooldown, style="secondary", height=32, min_width=140, pad_x=GAP)
+        button.pack(side="right")
+        button.set_enabled(self._login_thread is None)
+        cached = self.store.cooldowns.get(steam_id)
+        message, color = "Not checked yet", FG_MUTED
+        if cached:
+            message = cached["message"]
+            color = ERR if cached["state"] == "active" else OK
+            if cached.get("expires_at") and cached["expires_at"] <= time.time():
+                message, color = "Recorded cooldown has elapsed — refresh to confirm.", FG_MUTED
+        tk.Label(panel, text=message, bg=SURFACE, fg=color, font=("Segoe UI", 10),
+                 anchor="w", justify="left", wraplength=CONTENT_W - 2 * GAP).pack(fill="x", pady=(GAP, 0))
+        if cached:
+            checked = datetime.fromtimestamp(cached["checked_at"], timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            note = f"Last refreshed: {checked}. Updates when this account logs into Steam."
+        else:
+            note = "Checks automatically when this account is logged into Steam."
+        tk.Label(panel, text=note, bg=SURFACE, fg=FG_FAINT, font=("Segoe UI", 9),
+                 anchor="w", justify="left", wraplength=CONTENT_W - 2 * GAP).pack(fill="x", pady=(GAP, 0))
+        notice = self._cooldown_notice.get(steam_id)
+        if notice:
+            tk.Label(panel, text=notice, bg=SURFACE, fg=FG_MUTED, font=("Segoe UI", 9),
+                     anchor="w", justify="left", wraplength=CONTENT_W - 2 * GAP).pack(fill="x", pady=(GAP, 0))
+
+    def _refresh_cooldown_details(self):
+        self._set_details(self._detail_rows)
+        self._refit()
+
+    def _check_cooldown(self, steam_id=None, *, automatic=False):
+        if self._cooldown_check is not None:
+            if not automatic:
+                self._stop_cooldown_check()
+                self._refresh_cooldown_details()
+            return
+        steam_id = steam_id or self._current_steam_id()
+        if steam_id is None or self._login_thread is not None or self._closing:
+            return
+        session = current_steam_session()
+        if session is not None and session[0] == steam_id:
+            self._steam_session_seen = session
+        cancel, events = threading.Event(), queue.Queue()
+        def worker():
+            try:
+                result = check_client_cooldown(steam_id, cancel=cancel)
+            except Exception:
+                result = {"state": "unknown", "message": "Could not read the cooldown from Steam. Retry after Steam finishes loading."}
+            if not cancel.is_set():
+                events.put(result)
+        thread = threading.Thread(target=worker, name="Steam cooldown check", daemon=True)
+        self._cooldown_check = (steam_id, thread, cancel, events)
+        self._cooldown_notice[steam_id] = "Checking the account already logged into Steam…"
+        thread.start()
+        self._refresh_cooldown_details()
+        self._cooldown_poll_job = self.root.after(100, self._poll_cooldown_check)
+
+    def _poll_cooldown_check(self):
+        self._cooldown_poll_job = None
+        if self._cooldown_check is None:
+            return
+        steam_id, thread, cancel, events = self._cooldown_check
+        try:
+            result = events.get_nowait()
+        except queue.Empty:
+            self._cooldown_poll_job = self.root.after(100, self._poll_cooldown_check)
+            return
+        self._cooldown_check = None
+        if result.get("state") in ("active", "clear"):
+            try:
+                self.store.set_cooldown(steam_id, result)
+            except (OSError, ValueError):
+                self._cooldown_notice[steam_id] = "Check completed, but could not save it. Check access to the accounts file."
+            else:
+                self._cooldown_notice.pop(steam_id, None)
+        else:
+            self._cooldown_notice[steam_id] = result.get("message", "Could not read Steam’s page.")
+        self._refresh_cooldown_details()
+
+    def _stop_cooldown_check(self):
+        if self._cooldown_poll_job is not None:
+            self.root.after_cancel(self._cooldown_poll_job)
+            self._cooldown_poll_job = None
+        if self._cooldown_check is None:
+            return
+        steam_id, thread, cancel, events = self._cooldown_check
+        cancel.set()
+        self._cooldown_check = None
+        self._cooldown_notice[steam_id] = "Check cancelled. Saved data is unchanged."
+
+    def _watch_steam_session(self):
+        self._steam_watch_job = None
+        if self._closing:
+            return
+        session = current_steam_session()
+        if session != self._steam_session_seen and self._login_thread is None and self._cooldown_check is None:
+            if session is None:
+                self._steam_session_seen = None
+            if session is not None:
+                steam_id = session[0]
+                known = False
+                for account in self.store.accounts:
+                    try:
+                        payload = decode_token(account["token"]).get("payload")
+                        if isinstance(payload, dict) and payload.get("sub") == steam_id:
+                            known = True
+                            break
+                    except (ExtractionError, KeyError):
+                        continue
+                if known:
+                    self._check_cooldown(steam_id, automatic=True)
+        self._steam_watch_job = self.root.after(3000, self._watch_steam_session)
+
+    def _stop_steam_watch(self, event):
+        if event.widget is self.root:
+            if self._steam_watch_job is not None:
+                self.root.after_cancel(self._steam_watch_job)
+                self._steam_watch_job = None
+            self._stop_cooldown_check()
 
     def _show_error(self, message: str):
         self.current_account = None
@@ -973,6 +1579,11 @@ class App:
 
     def _set_status(self, text: str, color: str = FG_MUTED):
         self.status.configure(text=text, fg=color)
+        if text:
+            self.status.pack(fill="x", pady=(GAP if self.actions.winfo_manager() else 0, 0))
+        else:
+            self.status.pack_forget()
+        self._fit_footer_spacing()
         self._refit()
 
     def _copy(self, announce: bool = True):
@@ -1001,7 +1612,8 @@ class App:
     def _refit(self):
         """Resize the window to its content's height, keeping its position."""
         self.root.update_idletasks()
-        content_height = self.content.winfo_reqheight()
+        page = self._pages[self.active_tab]
+        content_height = page.winfo_reqheight() + (PAD if not self.footer.winfo_manager() else 0)
         self.viewport.configure(height=content_height, scrollregion=(0, 0, WIN_W, content_height))
         self.root.update_idletasks()
         h = min(self.root.winfo_reqheight(), self.root.winfo_screenheight() - 120)

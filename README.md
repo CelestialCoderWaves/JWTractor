@@ -17,6 +17,49 @@ app and standalone `.exe`; Node.js and SteamNFATool are not required.
 
 ## How it works
 
+Use the compact **Settings** button in the upper-left corner to manage login
+options. Preferences are saved automatically and apply to every selected
+account. Click **← Accounts** to return to extraction, saved accounts, and login
+actions. **Ctrl+Tab** switches views; the corner button also supports Enter,
+Space, and Left/Right.
+
+Under **Settings → CS2 launch options**, enter your custom options and turn on
+**Use custom launch options**. The text is saved when you leave the field or
+press Enter, and is applied to the selected account before Steam starts on
+each JWTractor login. Quotes and other arguments are preserved as entered.
+It replaces CS2's existing launch options; an enabled empty field clears them.
+The toggle is off by default and leaves Steam's current options alone when off.
+These changes share the login backups and rollback and preserve other games
+and accounts. CS2 itself is not launched automatically. You can check the result
+in Steam's **CS2 → Properties → General → Launch Options**, as described in
+[Steam's launch-options guide](https://help.steampowered.com/en/faqs/view/7D01-D2DD-D75E-2955).
+
+**Disable Steam Cloud Sync** under **Settings → Login options** is on by default to help
+with crashes when Cloud sync is enabled. JWTractor remembers this option and
+sets the selected account's global `cloudenabled` preference to `0` in
+`userdata/<account-id>/7/remote/sharedconfig.vdf` before launching Steam.
+An existing legacy `config/sharedconfig.vdf` copy is updated too. These files
+use the login transaction's backups and rollback; other accounts, per-game
+preferences, and save files are preserved. This applies on each JWTractor login.
+Turning the toggle off leaves Steam's current setting alone; re-enable syncing
+in Steam **Settings → Cloud** when wanted. While disabled, game saves do not
+sync between devices. This config change is tested with synthetic accounts;
+confirm Cloud is off in your client to verify the crash workaround.
+Steam documents the account-wide setting in its
+[Steam Cloud documentation](https://partner.steamgames.com/doc/features/cloud).
+
+Turn on **Appear offline & disable Remote Play** under **Settings → Login options** to
+start the selected account with **Invisible** friends status and Remote Play
+disabled. Steam stays connected so games, downloads, and the store still work.
+This is a global login option: it applies to every account you log in to while
+enabled. JWTractor remembers the toggle between launches; it is off by default.
+
+These settings are merged into the selected account's `localconfig.vdf` before
+Steam starts, with the same backups and rollback as the login configuration.
+Other accounts' settings are preserved. Turning the toggle off leaves Steam's
+current settings alone; use Steam to change them back. A valid token is still
+required, and live verification of these preferences is pending a working token.
+
 The embedded string is a **JWT** — three base64url chunks separated by dots
 (`header.payload.signature`). In these executables it's stored as plain ASCII
 text, so there's no real "decompilation" or reverse-engineering needed: the app
@@ -46,14 +89,15 @@ running it:
 | [`tests/test_store.py`](tests/test_store.py) | Saved-account store tests (temp files, synthetic tokens). |
 | [`tests/test_steam_login.py`](tests/test_steam_login.py) | Login workflow and account-preservation tests using temporary files and synthetic tokens. |
 | [`tests/test_app_login.py`](tests/test_app_login.py) | Extraction, selection, login and cancellation UI tests with a mocked Steam backend. |
+| [`cooldown.py`](cooldown.py) | Reads matchmaking data through the signed-in Steam client and validates the account. |
 | [`build.ps1`](build.ps1) | Builds the standalone `.exe` with PyInstaller. |
 | [`make_icon.py`](make_icon.py) | Build-time helper that draws the app/exe icon (`icon.ico`). |
-| [`requirements.txt`](requirements.txt) | The one optional dependency (`tkinterdnd2`). |
+| [`requirements.txt`](requirements.txt) | Drag-and-drop and Steam page-interface dependencies. |
 
 Extraction only **reads** the file you give it. It never modifies, uploads,
 or executes that input. The optional Steam login action updates local Steam
-configuration and launches the installed Steam client. JWTractor itself does
-not make network requests; Steam handles authentication.
+configuration and launches the installed Steam client. The optional cooldown
+check reads Steam Community through the already signed-in Steam client.
 
 ## Quick start (from source)
 
@@ -74,6 +118,35 @@ to add a token that has already been extracted.
 > also get drag-and-drop directly into the window.
 
 ## Saved accounts
+
+Account **Details → CS2 matchmaking cooldown** reads the personal matchmaking
+page using the account already logged into the Windows Steam client. No separate
+browser sign-in is needed. A successful check shows an active cooldown and its
+expiry, or **No active matchmaking cooldown**. Signed-out, wrong-account, and
+unreadable pages cannot produce a clean result.
+
+JWTractor automatically refreshes after it confirms a Steam login and when it
+detects a saved account starting or switching in Steam while JWTractor is open.
+**Refresh data** also checks manually. If Steam has no Community page open,
+the check opens the matchmaking page in Steam’s own window. This may change
+the page displayed in Steam; it does not change the account or launch CS2.
+
+Steam must expose its local CEF page interface. JWTractor supplies
+`-cef-enable-debugging` when launching Steam. For an already-running client,
+log in through JWTractor once to restart it with that flag. The checker uses
+only the local interface at `127.0.0.1:8080`, performs the read inside Steam’s
+existing Community session, and does not access session-cookie databases.
+Clients started elsewhere without the flag report that the interface is
+unavailable, preserving the saved result.
+
+Successful results and their **Last refreshed** UTC timestamp are saved locally
+in the accounts file, keyed by SteamID. They remain available after restarting
+JWTractor or adding a fresh token for the same account. Loading saved details
+does not ask you to sign in again.
+The displayed result is the last known status, not a live guarantee. An elapsed
+cached expiry asks you to refresh; a failed or cancelled check preserves the
+previous result. No password, web cookie, or page contents are saved by the
+cooldown cache.
 
 Every token you extract is **remembered**, so you can re-select an account you've
 used before without hunting down the original `.exe`. Click **Saved accounts**
@@ -128,8 +201,8 @@ If Steam reports **Access denied**, confirm the session with the account owner
 or obtain a fresh client refresh token. JWTractor cannot override that rejection.
 
 The other accounts' saved credentials and remember-login settings are preserved.
-Only the selected account's login fields and the startup account selection
-change. Current Steam clients select an account with `AutoLogin`; older clients
+The selected account's login fields, startup account selection, and enabled
+login options change. Current Steam clients select an account with `AutoLogin`; older clients
 use `MostRecent` and `AllowAutoLogin`. JWTractor follows the format already in
 your file and uses `AutoLogin` for a new file. It also disables Steam's
 **Ask which account to use each time Steam starts** preference at
@@ -186,8 +259,9 @@ the full list.
 
 ## Building a standalone .exe (to share with friends)
 
-This produces a single `dist\JWTractor.exe` that needs **nothing installed**
-on the other machine. From this folder, in PowerShell:
+This produces a single `dist\JWTractor.exe` that needs no Python installed
+on the other machine. Cooldown checks use the installed Steam client.
+From this folder, in PowerShell:
 
 ```powershell
 .\build.ps1
@@ -196,8 +270,9 @@ on the other machine. From this folder, in PowerShell:
 If PowerShell blocks the script, either run the underlying command directly:
 
 ```powershell
-pip install pyinstaller tkinterdnd2 pillow
+pip install pyinstaller tkinterdnd2 pillow websocket-client
 python make_icon.py
+python make_toggle_graphics.py
 python -m PyInstaller --noconfirm --onefile --windowed --name JWTractor --icon icon.ico --add-data "icon.ico;." --collect-all tkinterdnd2 app.py
 ```
 

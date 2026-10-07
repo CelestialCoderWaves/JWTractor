@@ -288,6 +288,94 @@ def merge_account(documents, steam_id, account_name, encrypted, timestamp):
     return result
 
 
+def merge_private_login(document, steam_id):
+    """Merge only this account's local presence and Remote Play preferences."""
+    account_id = str(int(steam_id) & 0xffffffff)
+    result = copy.deepcopy(document)
+    streaming = _section(result, "UserLocalConfigStore", "streaming_v2", create=True)
+    if not isinstance(streaming.get(_key(streaming, "EnableStreaming"), "0"), str):
+        raise SteamLoginError("Unexpected Remote Play preference type. No files were written.")
+    _set(streaming, "EnableStreaming", "0")
+    storage = _section(result, "UserLocalConfigStore", "WebStorage", create=True)
+    preference_key = _key(storage, "FriendStoreLocalPrefs_" + account_id)
+    original = storage.get(preference_key, "{}")
+    def unique_object(pairs):
+        parsed = {}
+        for key, value in pairs:
+            if key in parsed:
+                raise ValueError("Duplicate preference key")
+            parsed[key] = value
+        return parsed
+    try:
+        preferences = json.loads(original, object_pairs_hook=unique_object,
+                                 parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
+        if not isinstance(preferences, dict):
+            raise ValueError("Expected an object")
+    except (TypeError, ValueError, RecursionError):
+        raise SteamLoginError("Cannot read this account's friends preferences. No Steam configuration was changed.") from None
+    preferences["ePersonaState"] = 7  # Invisible: Steam stays connected.
+    storage[preference_key] = json.dumps(preferences, separators=(",", ":"), ensure_ascii=False)
+    # Verify that all other settings survive, including other JSON fields.
+    restored = copy.deepcopy(result)
+    restored_streaming = _section(restored, "UserLocalConfigStore", "streaming_v2")
+    old_streaming = _section(document, "UserLocalConfigStore", "streaming_v2")
+    restored_streaming.pop(_key(restored_streaming, "EnableStreaming"))
+    if _key(old_streaming, "EnableStreaming") in old_streaming:
+        old_key = _key(old_streaming, "EnableStreaming")
+        restored_streaming[old_key] = old_streaming[old_key]
+    restored_storage = _section(restored, "UserLocalConfigStore", "WebStorage")
+    restored_storage.pop(preference_key)
+    old_storage = _section(document, "UserLocalConfigStore", "WebStorage")
+    if preference_key in old_storage:
+        restored_storage[preference_key] = original
+    def leaves(node, path=()):
+        return {entry: value for key, value in node.items()
+                for entry, value in (leaves(value, path + (key,)).items() if isinstance(value, dict)
+                                     else [(path + (key,), value)])}
+    if leaves(restored) != leaves(document):
+        raise SteamLoginError("Account preference preservation check failed. No files were written.")
+    return result
+
+
+def validate_cs2_launch_options(options):
+    if not isinstance(options, str) or len(options) > 4096:
+        raise SteamLoginError("CS2 launch options must be text of at most 4096 characters.")
+    if re.search(r"[\x00-\x1f\x7f]", options):
+        raise SteamLoginError("CS2 launch options must be a single line without control characters.")
+    try:
+        options.encode("utf-8")
+    except UnicodeError:
+        raise SteamLoginError("CS2 launch options contain invalid text.") from None
+    return options
+
+
+def merge_cs2_launch_options(document, options):
+    """Set only CS2's per-account LaunchOptions, preserving the exact text."""
+    options = validate_cs2_launch_options(options)
+    result = copy.deepcopy(document)
+    app = _section(result, "UserLocalConfigStore", "Software", "Valve", "Steam", "apps", "730", create=True)
+    key = _key(app, "LaunchOptions")
+    if key in app and not isinstance(app[key], str):
+        raise SteamLoginError("Unexpected CS2 launch-options preference type. No files were written.")
+    app[key] = options
+    return result
+
+
+def merge_disable_cloud_sync(document):
+    """Disable account-wide Cloud sync, preserving per-game and other settings.
+
+    Steam stores the account-wide switch in its roaming sharedconfig.vdf,
+    separately from each game's apps/<appid>/cloudenabled preference.
+    """
+    result = copy.deepcopy(document)
+    steam = _section(result, "UserRoamingConfigStore", "Software", "Valve", "Steam", create=True)
+    key = _key(steam, "cloudenabled")
+    if key in steam and not isinstance(steam[key], str):
+        raise SteamLoginError("Unexpected Steam Cloud preference type. No files were written.")
+    steam[key] = "0"
+    return result
+
+
 @dataclass
 class ConfigFile:
     path: Path
@@ -515,7 +603,7 @@ def _set_autologin(account_name):
 
 
 def _launch_steam(steam_dir):
-    subprocess.Popen([str(Path(steam_dir) / "steam.exe")], stdin=subprocess.DEVNULL,
+    subprocess.Popen([str(Path(steam_dir) / "steam.exe"), "-cef-enable-debugging"], stdin=subprocess.DEVNULL,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                      creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
@@ -578,7 +666,8 @@ def wait_for_sign_in(path, steam_id, checkpoint, cancel=None, timeout=30):
     return "unconfirmed", None
 
 
-def login_account(account_name, token, *, cancel=None, progress=None):
+def login_account(account_name, token, *, cancel=None, progress=None, private_login=False,
+                  disable_cloud_sync=False, cs2_launch_options=None):
     """Log in the selected account; never use a display alias as the login name."""
     if not IS_WINDOWS:
         raise SteamLoginError("Steam login is available on Windows only.")
@@ -586,22 +675,53 @@ def login_account(account_name, token, *, cancel=None, progress=None):
     _check_cancel(cancel)
     account_name = validate_account_name(account_name).lower()
     payload = validate_token(token)
+    if cs2_launch_options is not None:
+        cs2_launch_options = validate_cs2_launch_options(cs2_launch_options)
     installation = _find_installation()
     local_base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
     paths = [installation / "config" / "config.vdf", installation / "config" / "loginusers.vdf", local_base / "Steam" / "local.vdf"]
+    account_dir = installation / "userdata" / str(int(payload["sub"]) & 0xffffffff)
+    preference_merges = []
+    if private_login or cs2_launch_options is not None:
+        def merge_local_preferences(data):
+            if private_login:
+                data = merge_private_login(data, payload["sub"])
+            if cs2_launch_options is not None:
+                data = merge_cs2_launch_options(data, cs2_launch_options)
+            return data
+        preference_merges.append((account_dir / "config" / "localconfig.vdf",
+                                  merge_local_preferences))
+    if disable_cloud_sync:
+        preference_merges.append((account_dir / "7" / "remote" / "sharedconfig.vdf", merge_disable_cloud_sync))
+        # Older clients also keep a local roaming-config copy. Update it when
+        # present so it cannot reintroduce an enabled setting on startup.
+        legacy = account_dir / "config" / "sharedconfig.vdf"
+        if legacy.exists():
+            preference_merges.append((legacy, merge_disable_cloud_sync))
+    paths.extend(path for path, merge in preference_merges)
     with config_lock(paths[0]):
         progress("Preparing Steam login…")
         encrypted = encrypt_with_dpapi(token, account_name)
         for path in paths:
             read_config(path)  # Reject invalid files before closing the client.
+        for path, merge in preference_merges:
+            merge(read_config(path).data)
         _check_cancel(cancel)
         progress("Closing Steam…")
         close_steam(installation, cancel)
         _check_cancel(cancel)
         configs = [read_config(path) for path in paths]
         validate_token(token)  # Recheck after waiting for shutdown.
-        originals = [config.data for config in configs]
+        originals = [config.data for config in configs[:3]]
         updated = merge_account(originals, payload["sub"], account_name, encrypted, int(time.time()))
+        for config, (_, merge) in zip(configs[3:], preference_merges):
+            updated.append(merge(config.data))
+        if private_login:
+            progress("Setting friends status to Invisible and disabling Remote Play…")
+        if disable_cloud_sync:
+            progress("Disabling Steam Cloud Sync for the selected account…")
+        if cs2_launch_options is not None:
+            progress("Setting custom CS2 launch options…")
         for config, data in zip(configs, updated):
             config.data = data
         progress("Saving account; keeping other remembered accounts…")
@@ -628,4 +748,6 @@ def login_account(account_name, token, *, cancel=None, progress=None):
         users = _section(originals[1], "users")
         return {"steam_id": payload["sub"], "backups": [str(path) for path in backups],
                 "preserved_accounts": sum(user_id != payload["sub"] for user_id in users), "warning": warning,
-                "sign_in": sign_in, "reason": reason}
+                "sign_in": sign_in, "reason": reason, "private_login": bool(private_login),
+                "disable_cloud_sync": bool(disable_cloud_sync),
+                "cs2_launch_options_applied": cs2_launch_options is not None}
