@@ -23,6 +23,23 @@ account. Click **← Accounts** to return to extraction, saved accounts, and log
 actions. **Ctrl+Tab** switches views; the corner button also supports Enter,
 Space, and Left/Right.
 
+File imports run in the background, so the window stays responsive while an
+executable is being read. **Cancel import** discards the pending result without
+adding an account or changing your previous selection.
+
+The account token is visible in the result card. **Copy** copies the full
+`username----token` string. A clipboard failure leaves the account saved and
+offers a retry instead of reporting a successful copy.
+
+| Shortcut | Action |
+| --- | --- |
+| **Ctrl+O** | Browse for an executable. |
+| **Ctrl+K** | Open saved accounts and focus search. |
+| **Ctrl+V** | Open the paste dialog with clipboard text; normal paste inside text fields. |
+| **Ctrl+C** | Copy the account result; normal copy inside text fields. |
+| **Ctrl+Tab** | Switch between Accounts and Settings. |
+| **Escape** | Close the account picker or return from Settings; otherwise close the app. |
+
 Under **Settings → CS2 launch options**, enter your custom options and turn on
 **Use custom launch options**. The text is saved when you leave the field or
 press Enter, and is applied to the selected account before Steam starts on
@@ -151,6 +168,13 @@ cooldown cache.
 Every token you extract is **remembered**, so you can re-select an account you've
 used before without hunting down the original `.exe`. Click **Saved accounts**
 to open the list; each entry shows its name and issuer.
+
+Search by alias, login name, issuer, or SteamID. Multiple search words narrow the
+results together. **Down** moves from search into the results; **Up/Down** moves
+between accounts and scrolls the focused row into view. **Enter** selects the
+focused account (or the first match when searching). The list marks the selected
+account and expired tokens, and long account names wrap within their row.
+Renaming an account changes its display name without changing the login target.
 
 - **Load** — click an account to put its `name----token` back in the box and copy it.
 - **Rename** — give an account a friendly **alias** (e.g. "main" or "burner"), so a

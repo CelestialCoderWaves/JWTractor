@@ -594,3 +594,207 @@ def test_cancelled_client_check_cannot_update_cache(window):
     window._poll_cooldown_check()
     assert cancel.is_set()
     assert steam_id not in window.store.cooldowns
+
+
+def test_account_switch_shows_matching_identity_and_cached_cooldown(window):
+    alice = window.store.add(jwt(), "alice")
+    bob_id = "76561198000000001"
+    bob = window.store.add(jwt({"sub": bob_id}), "bob")
+    window.store.set_alias(bob["id"], "Main account")
+    window.store.set_cooldown(bob_id, {"state": "active", "message": "Bob cooldown"})
+    window._use_account(alice)
+    assert "Bob cooldown" not in detail_text(window)
+    window._use_account(bob)
+    text = detail_text(window)
+    assert "Bob cooldown" in text
+    assert "Main account" in text and "Steam login: bob" in text
+    assert window.result_text == gui.account_combined(bob)
+
+
+def test_renaming_another_account_does_not_change_login_target(window):
+    alice = window._add_token("alice----" + jwt())
+    bob = window.store.add(jwt({"sub": "76561198000000001"}), "bob")
+    window._rename_account(bob)
+    window._rename_dialog.alias.insert(0, "Secondary")
+    window._rename_dialog._submit()
+    assert window.current_account is alice
+    assert window.result_text == gui.account_combined(alice)
+    assert "Steam login: alice" in detail_text(window)
+
+
+def test_visible_token_matches_full_copy_and_updates_on_account_change(window, monkeypatch):
+    copied = []
+    monkeypatch.setattr(window.root, "clipboard_append", copied.append)
+    alice = window._add_token("alice----" + jwt())
+    assert window.output.get("1.0", "end-1c") == gui.account_combined(alice)
+    assert copied[-1] == gui.account_combined(alice)
+    bob = window.store.add(jwt({"sub": "76561198000000001"}), "bob")
+    window._use_account(bob)
+    assert window.output.get("1.0", "end-1c") == gui.account_combined(bob)
+    assert copied[-1] == gui.account_combined(bob)
+
+
+def test_clipboard_failure_does_not_lose_successful_import(window, monkeypatch):
+    def fail():
+        raise tk.TclError("Synthetic busy clipboard")
+    monkeypatch.setattr(window.root, "clipboard_clear", fail)
+    account = window._add_token("alice----" + jwt())
+    assert window.current_account is account
+    assert gui.Store(window.store.path).get(account["id"]) is not None
+    assert "clipboard unavailable" in window.status.cget("text")
+    assert "copied" not in window.status.cget("text")
+    assert window._copy() is False
+    assert "try Copy again" in window.status.cget("text")
+
+
+def test_account_search_matches_alias_username_and_steam_id_and_recovers_empty_search(window):
+    alice = window.store.add(jwt(), "alice")
+    bob_id = "76561198000000001"
+    bob = window.store.add(jwt({"sub": bob_id}), "bob")
+    window.store.set_alias(bob["id"], "Main account")
+    window._open_picker()
+    popup = window._picker
+    for query in ("MAIN bob", bob_id, "main ACCOUNT"):
+        popup.query.set(query)
+        assert popup.matches == [bob]
+    popup.query.set("no such account")
+    assert popup.matches == [] and popup.rows == []
+    popup.query.set("ALICE")
+    assert popup.matches == [alice]
+    popup.query.set("")
+    assert len(popup.matches) == 2
+    window._close_picker()
+
+
+def test_import_worker_keeps_ui_responsive_and_does_not_apply_cancelled_result(window, monkeypatch):
+    alice = window._add_token("alice----" + jwt())
+    entered, release = threading.Event(), threading.Event()
+    main_thread = threading.get_ident()
+    def extract(path):
+        assert threading.get_ident() != main_thread
+        entered.set()
+        assert release.wait(3)
+        return gui.parse_token_input("bob----" + jwt({"sub": "76561198000000001"}))
+    monkeypatch.setattr(gui, "extract_from_file", extract)
+    window._start_extraction("synthetic.exe")
+    assert entered.wait(2)
+    worker = window._extraction[0]
+    assert not window.saved_btn._enabled and window.login_btn._text == "Cancel import"
+    tick = []
+    window.root.after_idle(lambda: tick.append(True))
+    window.root.update()
+    assert tick == [True]
+    window._login_to_steam()  # The main action cancels an import, without launching Steam.
+    assert window._extraction is None
+    release.set()
+    worker.join(timeout=2)
+    window.root.update()
+    assert window.store.accounts == [alice]
+    assert window.current_account is alice
+    assert window.login_btn._text == "Log in to Steam"
+
+
+def test_background_import_saves_result_on_main_thread(window, tmp_path, monkeypatch):
+    executable = tmp_path / "alice.exe"
+    executable.write_bytes(b"synthetic file " + jwt().encode())
+    main_thread = threading.get_ident()
+    original_save = window.store.save
+    def save():
+        assert threading.get_ident() == main_thread
+        original_save()
+    monkeypatch.setattr(window.store, "save", save)
+    window._start_extraction(str(executable))
+    deadline = time.monotonic() + 3
+    while window._extraction is not None and time.monotonic() < deadline:
+        window.root.update()
+        time.sleep(0.01)
+    assert window._extraction is None
+    assert window.current_account["username"] == "alice"
+    assert "copied · saved" in window.status.cget("text")
+
+
+def test_escape_closes_picker_or_leaves_settings_without_closing_program(window):
+    window._add_token("alice----" + jwt())
+    window._open_picker()
+    window._escape()
+    assert window._picker is None and window.root.winfo_exists()
+    window._select_tab("settings")
+    window._escape()
+    assert window.active_tab == "accounts" and window.root.winfo_exists()
+
+
+def test_picker_keyboard_navigation_scrolls_rows_into_view_and_enter_selects(window):
+    for index in range(10):
+        window.store.add(jwt({"sub": str(76561198000000001 + index)}), f"account_{index}")
+    window.root.deiconify()
+    window._open_picker()
+    popup = window._picker
+    window.root.update()
+    popup.search.focus_force()
+    popup.search.event_generate("<Down>")
+    window.root.update()
+    assert popup.focus_get() is popup.rows[0]
+    for row in popup.rows[:-1]:
+        row.event_generate("<Down>")
+        window.root.update()
+    last = popup.rows[-1]
+    assert popup.focus_get() is last
+    assert last.winfo_rooty() + last.winfo_height() <= popup.winfo_rooty() + popup.winfo_height()
+    selected = popup.matches[-1]
+    last.event_generate("<Return>")
+    window.root.update()
+    assert window._picker is None and window.current_account is selected
+
+
+def test_refresh_on_new_account_replaces_other_accounts_check(window, monkeypatch):
+    bob_id = "76561198000000001"
+    bob = window.store.add(jwt({"sub": bob_id}), "bob")
+    old_cancel = threading.Event()
+    window._cooldown_check = ("76561198000000002", None, old_cancel, gui.queue.Queue())
+    window._use_account(bob)
+    assert window.cooldown_btn._text == "Refresh data"
+    entered, release = threading.Event(), threading.Event()
+    def check(steam_id, *, cancel):
+        assert steam_id == bob_id
+        entered.set()
+        assert release.wait(3)
+        return {"state": "clear", "message": "Bob verified"}
+    monkeypatch.setattr(gui, "check_client_cooldown", check)
+    window._check_cooldown()
+    assert entered.wait(2)
+    assert old_cancel.is_set()
+    worker = window._cooldown_check[1]
+    assert window._cooldown_check[0] == bob_id
+    release.set()
+    worker.join(timeout=2)
+    window._poll_cooldown_check()
+    assert window.store.cooldowns[bob_id]["message"] == "Bob verified"
+
+
+def test_copy_and_paste_shortcuts_leave_editable_fields_alone(window, monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setattr(window, "_copy", lambda: pytest.fail("Must preserve native text copying"))
+    monkeypatch.setattr(window, "_open_token_dialog", lambda: pytest.fail("Must preserve native text pasting"))
+    assert window._copy_shortcut(SimpleNamespace(widget=window.cs2_launch_options_entry)) is None
+    assert window._paste_shortcut(SimpleNamespace(widget=window.cs2_launch_options_entry)) is None
+
+
+def test_paste_shortcut_prefills_dialog_without_saving_or_logging_in(window, monkeypatch):
+    from types import SimpleNamespace
+    pasted = "alice----" + jwt()
+    monkeypatch.setattr(window.root, "clipboard_get", lambda: pasted)
+    assert window._paste_shortcut(SimpleNamespace(widget=window.saved_btn)) == "break"
+    assert window._token_dialog.token.get("1.0", "end-1c") == pasted
+    assert window.store.accounts == [] and window._login_thread is None
+
+
+def test_find_accounts_from_settings_saves_draft_and_uses_existing_popup(window):
+    window._add_token("alice----" + jwt())
+    window._select_tab("settings")
+    window.cs2_launch_options_entry.insert(0, "-console")
+    window._open_picker()
+    popup = window._picker
+    assert window.active_tab == "accounts"
+    assert window.store.preferences["cs2_launch_options"] == "-console"
+    window._open_picker()
+    assert window._picker is popup

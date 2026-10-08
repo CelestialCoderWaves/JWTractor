@@ -35,7 +35,7 @@ from extractor import (
     parse_token_input,
     summarize_claims,
 )
-from store import Store, account_combined, account_label
+from store import Store, account_combined, account_label, account_status
 from steam_login import LoginCancelled, SteamLoginError, login_account, validate_account_name, validate_token
 from toggle_graphics import BUTTON_ICONS, DROP_ICONS, LOGO_IMAGE, SURFACE_CORNERS, SWITCH_IMAGES
 
@@ -529,6 +529,7 @@ class DropZone(tk.Canvas):
         self._focused = False
         self._enabled = True
         self._icons = {}
+        self._reading = False
         self._render()
         self.configure(cursor="hand2")
         self.bind("<Enter>", lambda e: self.set_hover(True))
@@ -559,6 +560,10 @@ class DropZone(tk.Canvas):
         self._hover = bool(on)
         self._render()
 
+    def set_reading(self, on):
+        self._reading = bool(on)
+        self._render()
+
     def _render(self):
         self.delete("all")
         hover = self._hover and self._enabled
@@ -569,9 +574,12 @@ class DropZone(tk.Canvas):
         cx = self._cw / 2
         self._icon(cx, 0, icon)
         line1 = "Drag an .exe here" if self._dnd else "Click to choose an .exe"
+        if self._reading:
+            line1 = "Reading executable…"
         self.create_text(cx, 0, text=line1, fill=FG, font=("Segoe UI", 12), tags="drop-title")
         self.create_text(
-            cx, 0, text="or click to browse" if self._dnd else "Browse for an executable file",
+            cx, 0, text="You can cancel the import below." if self._reading else
+                       "or click to browse" if self._dnd else "Browse for an executable file",
             fill=FG_MUTED, font=("Segoe UI", 10), tags="drop-hint",
         )
         cursor = 0
@@ -633,6 +641,7 @@ class App:
             pass
 
         self.result_text = ""  # the current "name----token" string
+        self._copy_reset_job = None
         self.store = Store()  # saved accounts (tokens + aliases) on disk
         self.private_login = self.store.preferences["private_login"]
         self.disable_cloud_sync = self.store.preferences["disable_cloud_sync"]
@@ -643,6 +652,8 @@ class App:
         self._token_dialog = None
         self._rename_dialog = None
         self._login_thread = None
+        self._extraction = None
+        self._extraction_poll_job = None
         self._login_cancel = threading.Event()
         self._login_events = queue.Queue()
         self._closing = False
@@ -658,9 +669,12 @@ class App:
         self._fit_and_center()  # size the window to its content, then centre
         _use_dark_titlebar(root)
 
-        # Keyboard: Ctrl+C copies the result, Esc closes the window.
-        root.bind("<Control-c>", lambda e: self._copy() if e.widget is not self.cs2_launch_options_entry else None)
-        root.bind("<Escape>", self._request_close)
+        # Text fields retain their native copy/paste behavior.
+        root.bind("<Control-c>", self._copy_shortcut)
+        root.bind("<Escape>", self._escape)
+        root.bind("<Control-o>", lambda _: self._browse())
+        root.bind("<Control-k>", lambda _: self._open_picker())
+        root.bind("<Control-v>", self._paste_shortcut)
         root.protocol("WM_DELETE_WINDOW", self._request_close)
         root.bind("<MouseWheel>", self._scroll_content)
         root.bind("<Control-Tab>", self._cycle_tab)
@@ -743,14 +757,14 @@ class App:
         self._build_settings()
 
         # result
-        self._section("RESULT").pack(fill="x", padx=PAD, pady=GAP)
+        self._section("ACCOUNT TOKEN").pack(fill="x", padx=PAD, pady=GAP)
         self.result_card = RoundedCard(self.content, CONTENT_W, fill=FIELD, border=BORDER, inset=GAP)
         self.result_card.pack(padx=PAD)
         self._text_padx = 0
         self.output = tk.Text(
-            self.result_card.inner, height=2, wrap="char", bg=FIELD, fg=FG,
+            self.result_card.inner, width=1, height=2, wrap="char", bg=FIELD, fg=FG,
             insertbackground=FG, relief="flat", highlightthickness=0, bd=0,
-            font=self._mono, padx=self._text_padx, pady=0,
+            font=self._mono, padx=self._text_padx, pady=0, selectbackground=ACCENT_LO,
         )
         self.output.pack(fill="x")
 
@@ -879,23 +893,81 @@ class App:
         self.drop.set_hover(False)
         paths = self.root.tk.splitlist(event.data)
         if paths:
-            self.process(paths[0], extra_files=len(paths) - 1)
+            self._start_extraction(paths[0], extra_files=len(paths) - 1)
 
     def _browse(self):
-        if self._login_thread is not None:
+        if self._login_thread is not None or self._extraction is not None:
             return
         path = filedialog.askopenfilename(
             title="Choose an executable",
             filetypes=[("Executables", "*.exe"), ("All files", "*.*")],
+            parent=self.root,
         )
         if path:
-            self.process(path)
+            self._start_extraction(path)
 
-    def process(self, path: str, extra_files: int = 0):
-        if self._login_thread is not None:
+    def _start_extraction(self, path, extra_files=0):
+        if self._login_thread is not None or self._extraction is not None or self._closing:
+            return
+        self._select_tab("accounts")
+        if self.active_tab != "accounts":
             return
         self._close_picker()
-        name = os.path.basename(path)
+        cancel, events = threading.Event(), queue.Queue()
+        def worker():
+            try:
+                result = extract_from_file(path)
+            except ExtractionError as exc:
+                event = ("error", str(exc))
+            except OSError:
+                event = ("error", "Could not read the executable. Check that it exists and is accessible, then try again.")
+            except Exception:
+                event = ("error", "Could not extract this file. Try another executable or paste the token.")
+            else:
+                event = ("done", result)
+            if not cancel.is_set():
+                events.put(event)
+        thread = threading.Thread(target=worker, name="Token extraction", daemon=True)
+        self._extraction = (thread, cancel, events, path, extra_files)
+        self.drop.set_reading(True)
+        self._refresh_login_action()
+        self._set_status(f"Reading {os.path.basename(path)}…")
+        thread.start()
+        self._extraction_poll_job = self.root.after(80, self._poll_extraction)
+
+    def _poll_extraction(self):
+        self._extraction_poll_job = None
+        if self._extraction is None:
+            return
+        thread, cancel, events, path, extra_files = self._extraction
+        try:
+            kind, value = events.get_nowait()
+        except queue.Empty:
+            self._extraction_poll_job = self.root.after(80, self._poll_extraction)
+            return
+        self._extraction = None
+        self.drop.set_reading(False)
+        self._refresh_login_action()
+        if kind == "error":
+            self._show_error(value)
+        else:
+            self._present_extracted(value, path, extra_files)
+
+    def _cancel_extraction(self):
+        if self._extraction_poll_job is not None:
+            self.root.after_cancel(self._extraction_poll_job)
+            self._extraction_poll_job = None
+        if self._extraction is not None:
+            self._extraction[1].set()
+            self._extraction = None
+            self.drop.set_reading(False)
+            self._refresh_login_action()
+            self._set_status("Import cancelled. No account was added.")
+
+    def process(self, path: str, extra_files: int = 0):
+        if self._login_thread is not None or self._extraction is not None:
+            return
+        self._close_picker()
         try:
             result = extract_from_file(path)
         except ExtractionError as exc:
@@ -908,6 +980,10 @@ class App:
             self._show_error(f"Unexpected error: {exc}")
             return
 
+        self._present_extracted(result, path, extra_files)
+
+    def _present_extracted(self, result, path, extra_files=0):
+        name = os.path.basename(path)
         try:
             self._accept_result(result)
         except OSError:
@@ -919,7 +995,8 @@ class App:
             note = f"  ·  {len(result['all_tokens'])} tokens found, showing first"
         elif extra_files:
             note = f"  ·  {extra_files} more ignored (drop one at a time)"
-        self._set_status(f"Extracted from {name} — copied · saved{note}", OK)
+        copied = "copied · saved" if self._last_copy_succeeded else "saved · clipboard unavailable; use Copy to retry"
+        self._set_status(f"Extracted from {name} — {copied}{note}", OK if self._last_copy_succeeded else FG_MUTED)
 
     def _accept_result(self, result):
         # Save successfully before replacing the current account or result.
@@ -930,12 +1007,12 @@ class App:
         self._refresh_login_action()
         self._refresh_saved()
         self._refit()
-        self._copy(announce=False)
+        self._last_copy_succeeded = self._copy(announce=False)
         return account
 
     # -- direct token entry --------------------------------------------------
     def _open_token_dialog(self):
-        if self._login_thread is not None:
+        if self._login_thread is not None or self._extraction is not None:
             return
         if self._token_dialog is not None:
             self._token_dialog.lift()
@@ -949,10 +1026,11 @@ class App:
         self.paste_btn.focus_set()
 
     def _add_token(self, text, username=""):
-        if self._login_thread is not None:
-            raise ExtractionError("Wait for Steam login to finish before adding an account.")
+        if self._login_thread is not None or self._extraction is not None:
+            raise ExtractionError("Wait for the current operation to finish before adding an account.")
         account = self._accept_result(parse_token_input(text, username))
-        self._set_status(f"Added {account_label(account)} — copied · saved", OK)
+        copied = "copied · saved" if self._last_copy_succeeded else "saved · clipboard unavailable; use Copy to retry"
+        self._set_status(f"Added {account_label(account)} — {copied}", OK if self._last_copy_succeeded else FG_MUTED)
         return account
 
     # -- saved accounts ------------------------------------------------------
@@ -978,9 +1056,18 @@ class App:
             self._picker.destroy()
             self._picker = None
             self._picker_closed_at = time.monotonic()
+            self.saved_btn.focus_set()
+        return "break"
 
     def _open_picker(self):
-        if self._login_thread is not None:
+        if self._login_thread is not None or self._extraction is not None:
+            return
+        if self._picker is not None:
+            if hasattr(self._picker, "search"):
+                self._picker.search.focus_set()
+            return
+        self._select_tab("accounts")
+        if self.active_tab != "accounts":
             return
         accounts = self.store.ordered()
         self.root.update_idletasks()
@@ -996,6 +1083,18 @@ class App:
         body = tk.Frame(top, bg=SURFACE)
         body.pack(fill="both", expand=True, padx=1, pady=1)
 
+        def fit_popup():
+            top.update_idletasks()
+            height = body.winfo_reqheight() + 2
+            popup_x = max(0, min(x, top.winfo_screenwidth() - width))
+            popup_y = y
+            if popup_y + height + PAD > top.winfo_screenheight():
+                above = self.saved_btn.winfo_rooty() - height - GAP
+                if above >= PAD:
+                    popup_y = above
+            popup_y = max(0, min(popup_y, top.winfo_screenheight() - height - PAD))
+            top.geometry(f"{width}x{height}+{popup_x}+{popup_y}")
+
         if not accounts:
             tk.Label(
                 body, text="No saved accounts yet.\nExtract a token and it's kept here.",
@@ -1003,27 +1102,103 @@ class App:
                 justify="left", padx=GAP, pady=GAP,
             ).pack(fill="x", anchor="w")
         else:
-            canvas = tk.Canvas(body, bg=SURFACE, highlightthickness=0, bd=0)
+            search_heading = tk.Frame(body, bg=SURFACE)
+            search_heading.pack(fill="x", padx=GAP, pady=GAP)
+            tk.Label(search_heading, text="Search accounts", bg=SURFACE, fg=FG,
+                     font=("Segoe UI Semibold", 10)).pack(side="left")
+            count = tk.Label(search_heading, bg=SURFACE, fg=FG_FAINT, font=("Segoe UI", 9))
+            count.pack(side="right")
+            query = tk.StringVar(master=top)
+            search = tk.Entry(body, textvariable=query, bg=FIELD, fg=FG, insertbackground=FG,
+                              selectbackground=ACCENT_LO, relief="flat", bd=0, font=("Segoe UI", 10),
+                              highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT)
+            search.pack(fill="x", padx=GAP, pady=(0, GAP), ipady=6)
+            top.search = search
+            top.query = query
+            list_frame = tk.Frame(body, bg=SURFACE)
+            list_frame.pack(fill="both", expand=True)
+            canvas = tk.Canvas(list_frame, bg=SURFACE, highlightthickness=0, bd=0,
+                               yscrollincrement=20)
+            scroll = tk.Canvas(list_frame, bg=SURFACE, width=12, height=1, bd=0,
+                               highlightthickness=0, cursor="hand2")
+            scroll.pack(side="right", fill="y")
+            def paint_scroll(first, last):
+                first, last = float(first), float(last)
+                scroll.delete("all")
+                height = max(1, scroll.winfo_height())
+                if last - first < 0.999:
+                    bottom = min(height, max(first * height + 12, last * height))
+                    scroll.create_polygon(_round_rect(3, first * height, 9, bottom, 3),
+                                          smooth=True, fill=BORDER_HI, outline="")
+            canvas.configure(yscrollcommand=paint_scroll)
+            scroll.bind("<Configure>", lambda _: paint_scroll(*canvas.yview()))
+            def drag_scroll(event):
+                first, last = canvas.yview()
+                canvas.yview_moveto(event.y / max(1, scroll.winfo_height()) - (last - first) / 2)
+            scroll.bind("<Button-1>", drag_scroll)
+            scroll.bind("<B1-Motion>", drag_scroll)
             inner = tk.Frame(canvas, bg=SURFACE)
-            canvas.create_window(0, 0, window=inner, anchor="nw", width=width - 2)
-            canvas.pack(fill="both", expand=True)
-            for acc in accounts:
-                self._build_account_row(inner, acc)
-            inner.update_idletasks()
-            content_h = inner.winfo_reqheight()
-            view_h = min(content_h, 6 * 80, max(80, self.root.winfo_screenheight() - y - 80))
-            canvas.configure(height=view_h, scrollregion=(0, 0, width - 2, content_h))
-            if content_h > view_h:
-                top.bind(
-                    "<MouseWheel>",
-                    lambda e: (canvas.yview_scroll(-1 if e.delta > 0 else 1, "units"), "break")[1],
-                )
+            canvas.create_window(0, 0, window=inner, anchor="nw", width=width - 14)
+            canvas.pack(side="left", fill="both", expand=True)
+            max_view_h = min(360, max(1, self.root.winfo_screenheight() - 240))
+            view_h = 1
+            top.rows = []
+            top.matches = []
 
-        top.update_idletasks()
-        height = top.winfo_reqheight()
-        x = max(0, min(x, top.winfo_screenwidth() - width))
-        y = max(0, min(y, top.winfo_screenheight() - height - PAD))
-        top.geometry(f"{width}x{height}+{x}+{y}")
+            def focus_row(index):
+                if not top.rows:
+                    return "break"
+                if index < 0:
+                    search.focus_set()
+                    return "break"
+                row = top.rows[min(index, len(top.rows) - 1)]
+                row.focus_set()
+                inner.update_idletasks()
+                first, last = canvas.yview()
+                content_h = max(1, inner.winfo_reqheight())
+                row_top, row_bottom = row.winfo_y(), row.winfo_y() + row.winfo_height()
+                if row_top < first * content_h:
+                    canvas.yview_moveto(row_top / content_h)
+                elif row_bottom > last * content_h:
+                    canvas.yview_moveto((row_bottom - view_h) / content_h)
+                return "break"
+
+            def render_matches(*_):
+                nonlocal view_h
+                if self._picker is not top:
+                    return
+                for child in inner.winfo_children():
+                    child.destroy()
+                terms = query.get().casefold().split()
+                top.matches = [acc for acc in accounts if all(term in " ".join(
+                    str(acc.get(key) or "") for key in ("alias", "username", "subject", "issuer")
+                ).casefold() for term in terms)]
+                count.configure(text=f"{len(top.matches)} of {len(accounts)}")
+                top.rows = []
+                for index, acc in enumerate(top.matches):
+                    row = self._build_account_row(inner, acc)
+                    top.rows.append(row)
+                    row.bind("<Down>", lambda _, i=index: focus_row(i + 1))
+                    row.bind("<Up>", lambda _, i=index: focus_row(i - 1))
+                if not top.matches:
+                    tk.Label(inner, text="No matching accounts. Try a name or SteamID.", bg=SURFACE,
+                             fg=FG_MUTED, font=("Segoe UI", 10), padx=GAP, pady=GAP,
+                             anchor="w").pack(fill="x")
+                inner.update_idletasks()
+                content_h = inner.winfo_reqheight()
+                view_h = min(content_h, max_view_h)
+                canvas.configure(height=view_h, scrollregion=(0, 0, width - 14, content_h))
+                canvas.yview_moveto(0)
+                fit_popup()
+
+            query.trace_add("write", render_matches)
+            render_matches()
+            search.bind("<Down>", lambda _: focus_row(0))
+            search.bind("<Return>", lambda _: (self._use_account(top.matches[0]) if top.matches else None, "break")[1])
+            top.bind("<MouseWheel>", lambda e: (canvas.yview_scroll(
+                (-1 if e.delta > 0 else 1) * max(1, abs(e.delta) // 120) * 2, "units"), "break")[1])
+
+        fit_popup()
         top.bind("<Escape>", self._close_picker)
         top.focus_force()
         def dismiss_if_outside():
@@ -1034,17 +1209,19 @@ class App:
                 self._close_picker()
         top.bind("<FocusOut>", lambda _: self.root.after_idle(dismiss_if_outside))
         if accounts:
-            top.after_idle(lambda: inner.winfo_children()[0].focus_set() if self._picker is top else None)
+            top.after_idle(lambda: search.focus_set() if self._picker is top else None)
 
     def _build_account_row(self, parent, acc):
         row = tk.Frame(parent, bg=SURFACE, takefocus=True)
         row.pack(fill="x")
 
+        actions = tk.Frame(row, bg=SURFACE)
+        actions.pack(side="right", padx=GAP)
         text = tk.Frame(row, bg=SURFACE)
         text.pack(side="left", fill="x", expand=True, padx=(GAP, 0), pady=GAP)
         name_lbl = tk.Label(
             text, text=account_label(acc), bg=SURFACE, fg=FG,
-            font=("Segoe UI Semibold", 11), anchor="w",
+            font=("Segoe UI Semibold", 11), anchor="w", wraplength=320, justify="left",
         )
         name_lbl.pack(anchor="w")
         parts = []
@@ -1052,14 +1229,16 @@ class App:
             parts.append(acc["username"])  # show the real username when aliased
         if acc.get("issuer"):
             parts.append(str(acc["issuer"]))
+        if self.current_account and self.current_account.get("id") == acc.get("id"):
+            parts.append("Selected")
+        if account_status(acc) == "expired":
+            parts.append("Token expired")
         sub_lbl = tk.Label(
             text, text="  ·  ".join(parts) or "—", bg=SURFACE, fg=FG_MUTED,
-            font=("Segoe UI", 9), anchor="w",
+            font=("Segoe UI", 9), anchor="w", wraplength=320, justify="left",
         )
         sub_lbl.pack(anchor="w", pady=(GAP, 0))
 
-        actions = tk.Frame(row, bg=SURFACE)
-        actions.pack(side="right", padx=GAP)
         rename_lbl = tk.Label(actions, text="Rename", bg=SURFACE, fg=FG_MUTED,
                               font=("Segoe UI", 9), cursor="hand2", takefocus=True)
         rename_lbl.pack(side="left", padx=(0, GAP))
@@ -1105,18 +1284,19 @@ class App:
         for w in (rename_lbl, del_lbl):
             w.bind("<Enter>", lambda e, ww=w: ww.configure(fg=FG), add="+")
             w.bind("<Leave>", lambda e, ww=w: ww.configure(fg=FG_MUTED), add="+")
+        return row
 
     def _use_account(self, acc):
-        if self._login_thread is not None:
+        if self._login_thread is not None or self._extraction is not None:
             return
         self._close_picker()
+        self.current_account = acc
         self._set_output(account_combined(acc))
         try:
             payload = decode_token(acc["token"]).get("payload")
         except Exception:  # pragma: no cover - stored tokens were valid when saved
             payload = None
         self._set_details(summarize_claims(payload))
-        self.current_account = acc
         self._refresh_login_action()
         try:
             self.store.touch(acc["id"])
@@ -1126,21 +1306,23 @@ class App:
             return
         self._refresh_saved()
         self._refit()
-        self._copy(announce=False)
-        self._set_status(f"Loaded {account_label(acc)} — copied", OK)
+        copied = self._copy(announce=False)
+        self._set_status(f"Loaded {account_label(acc)} — " + ("copied" if copied else "clipboard unavailable; use Copy to retry"),
+                         OK if copied else FG_MUTED)
 
     def _rename_account(self, acc):
-        if self._login_thread is not None:
+        if self._login_thread is not None or self._extraction is not None:
             return
         if self._rename_dialog is not None:
             self._rename_dialog.lift()
             self._rename_dialog.alias.focus_set()
             return
         self._close_picker()
-        self.current_account = acc
         def save(alias):
             self.store.set_alias(acc["id"], alias)
             self._refresh_saved()
+            if self.current_account and self.current_account.get("id") == acc["id"]:
+                self._refresh_cooldown_details()
         self._rename_dialog = RenameDialog(self.root, acc, save, self._rename_dialog_closed)
 
     def _rename_dialog_closed(self):
@@ -1148,6 +1330,8 @@ class App:
         self._open_picker()
 
     def _delete_account(self, acc):
+        if self._login_thread is not None or self._extraction is not None:
+            return
         self._close_picker()
         if messagebox.askyesno(
             "Delete account",
@@ -1178,7 +1362,7 @@ class App:
         self._toggle_login_option("disable_cloud_sync", self.disable_cloud_sync_btn, self.store.set_disable_cloud_sync)
 
     def _toggle_use_cs2_launch_options(self):
-        if self._login_thread is None and self._save_cs2_launch_options():
+        if self._login_thread is None and self._extraction is None and self._save_cs2_launch_options():
             self._toggle_login_option("use_cs2_launch_options", self.use_cs2_launch_options_btn,
                                       self.store.set_use_cs2_launch_options)
 
@@ -1192,7 +1376,7 @@ class App:
             self.cs2_options_field.fit()
 
     def _save_cs2_launch_options(self):
-        if self._login_thread is not None:
+        if self._login_thread is not None or self._extraction is not None:
             return True
         options = self.cs2_launch_options_entry.get()
         try:
@@ -1213,7 +1397,7 @@ class App:
         return saved
 
     def _toggle_login_option(self, name, button, save):
-        if self._login_thread is not None:
+        if self._login_thread is not None or self._extraction is not None:
             return
         try:
             save(not getattr(self, name))
@@ -1225,8 +1409,9 @@ class App:
         button.set_checked(getattr(self, name))
 
     def _refresh_login_action(self):
-        busy = self._login_thread is not None
-        self.login_btn.set_text("Cancel login" if busy else "Log in to Steam")
+        busy = self._login_thread is not None or self._extraction is not None
+        self.login_btn.set_text("Cancel import" if self._extraction is not None else
+                                "Cancel login" if busy else "Log in to Steam")
         self.login_btn.set_enabled(busy or (os.name == "nt" and self.current_account is not None))
         self.saved_btn.set_enabled(not busy)
         self.paste_btn.set_enabled(not busy)
@@ -1262,6 +1447,9 @@ class App:
             self.footer.pack_forget()
 
     def _login_to_steam(self):
+        if self._extraction is not None:
+            self._cancel_extraction()
+            return
         if self._login_thread is not None:
             self._login_cancel.set()
             self.login_btn.set_enabled(False)
@@ -1350,6 +1538,7 @@ class App:
             self.root.after(80, self._drain_login_events)
 
     def _request_close(self, *_):
+        self._cancel_extraction()
         self._stop_cooldown_check()
         if self._login_thread is not None:
             self._closing = True
@@ -1363,16 +1552,18 @@ class App:
     # -- output helpers ------------------------------------------------------
     def _set_output(self, text: str):
         self.result_text = text
+        self.copy_btn.set_text("Copy")
+        self.copy_btn.set_enabled(bool(text))
         self.output.configure(state="normal")
         self.output.delete("1.0", "end")
         if text:
             self.output.insert("1.0", text)
             self.output.configure(fg=FG)
         else:
-            self.output.insert("1.0", "The <name>----<token> string will appear here.")
+            self.output.insert("1.0", "Extract a file or paste a token to select an account.")
             self.output.configure(fg=FG_FAINT)
-        self.output.configure(state="disabled")
-        self.copy_btn.set_enabled(bool(text))
+        self.output.configure(state="disabled", takefocus=bool(text))
+        self.output.yview_moveto(0)
         self._reflow_output()
 
     def _reflow_output(self):
@@ -1393,16 +1584,30 @@ class App:
 
     def _set_details(self, rows: list[tuple[str, str]]):
         self._detail_rows = rows
+        self.cooldown_btn = None
         for child in self.details_inner.winfo_children():
             child.destroy()
         self.details_inner.columnconfigure(0, weight=0)
         self.details_inner.columnconfigure(1, weight=1)
+        offset = 0
+        if self.current_account:
+            account = self.current_account
+            heading = tk.Frame(self.details_inner, bg=SURFACE)
+            heading.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, GAP))
+            tk.Label(heading, text=account_label(account), bg=SURFACE, fg=FG,
+                     font=("Segoe UI Semibold", 12), anchor="w", justify="left",
+                     wraplength=CONTENT_W - 2 * GAP).pack(fill="x")
+            tk.Label(heading, text=f"Steam login: {account['username']}", bg=SURFACE, fg=FG_MUTED,
+                     font=("Segoe UI", 9), anchor="w", justify="left",
+                     wraplength=CONTENT_W - 2 * GAP).pack(fill="x", pady=(4, GAP))
+            tk.Frame(heading, bg=BORDER, height=1).pack(fill="x")
+            offset = 1
         if not rows:
             tk.Label(
                 self.details_inner,
                 text="Token claims (issuer, expiry, …) will appear here.",
                 bg=SURFACE, fg=FG_FAINT, font=("Segoe UI", 10), anchor="w",
-            ).grid(row=0, column=0, columnspan=2, sticky="ew")
+            ).grid(row=offset, column=0, columnspan=2, sticky="ew")
         else:
             _WARN_LABELS = {"Status", "Revoked if", "Note"}
             for i, (label, value) in enumerate(rows):
@@ -1417,15 +1622,15 @@ class App:
                 tk.Label(
                     self.details_inner, text=label, bg=SURFACE, fg=FG_MUTED,
                     font=("Segoe UI", 10),
-                ).grid(row=i, column=0, sticky="nw", padx=(0, GAP),
+                ).grid(row=i + offset, column=0, sticky="nw", padx=(0, GAP),
                        pady=(0, GAP) if i < len(rows) - 1 else 0)
                 tk.Label(
                     self.details_inner, text=value, bg=SURFACE, fg=val_fg,
                     font=("Segoe UI Semibold", 10),
                     wraplength=350, justify="left", anchor="w",
-                ).grid(row=i, column=1, sticky="ew",
+                ).grid(row=i + offset, column=1, sticky="ew",
                        pady=(0, GAP) if i < len(rows) - 1 else 0)
-        self._build_cooldown_details(len(rows) if rows else 1)
+        self._build_cooldown_details((len(rows) if rows else 1) + offset)
         self.details_card.fit()
 
     def _current_steam_id(self):
@@ -1449,7 +1654,7 @@ class App:
         heading.pack(fill="x")
         tk.Label(heading, text="CS2 matchmaking cooldown", bg=SURFACE, fg=FG,
                  font=("Segoe UI Semibold", 10)).pack(side="left")
-        checking = self._cooldown_check is not None
+        checking = self._cooldown_check is not None and self._cooldown_check[0] == steam_id
         self.cooldown_btn = button = RoundedButton(heading, "Cancel check" if checking else "Refresh data",
                                self._check_cooldown, style="secondary", height=32, min_width=140, pad_x=GAP)
         button.pack(side="right")
@@ -1480,14 +1685,17 @@ class App:
         self._refit()
 
     def _check_cooldown(self, steam_id=None, *, automatic=False):
-        if self._cooldown_check is not None:
-            if not automatic:
-                self._stop_cooldown_check()
-                self._refresh_cooldown_details()
-            return
         steam_id = steam_id or self._current_steam_id()
-        if steam_id is None or self._login_thread is not None or self._closing:
+        if steam_id is None or self._login_thread is not None or self._extraction is not None or self._closing:
             return
+        if self._cooldown_check is not None:
+            if automatic:
+                return
+            previous_id = self._cooldown_check[0]
+            self._stop_cooldown_check()
+            if previous_id == steam_id:
+                self._refresh_cooldown_details()
+                return
         session = current_steam_session()
         if session is not None and session[0] == steam_id:
             self._steam_session_seen = session
@@ -1564,10 +1772,19 @@ class App:
 
     def _stop_steam_watch(self, event):
         if event.widget is self.root:
+            if self._extraction_poll_job is not None:
+                self.root.after_cancel(self._extraction_poll_job)
+                self._extraction_poll_job = None
+            if self._extraction is not None:
+                self._extraction[1].set()
+                self._extraction = None
             if self._steam_watch_job is not None:
                 self.root.after_cancel(self._steam_watch_job)
                 self._steam_watch_job = None
             self._stop_cooldown_check()
+            if self._copy_reset_job is not None:
+                self.root.after_cancel(self._copy_reset_job)
+                self._copy_reset_job = None
 
     def _show_error(self, message: str):
         self.current_account = None
@@ -1587,14 +1804,55 @@ class App:
         self._refit()
 
     def _copy(self, announce: bool = True):
-        if not self.result_text or self._login_thread is not None:
-            return
-        self.root.clipboard_clear()
-        self.root.clipboard_append(self.result_text)
+        if not self.result_text or self._login_thread is not None or self._extraction is not None:
+            return False
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(self.result_text)
+        except tk.TclError:
+            if announce:
+                self._set_status("Clipboard unavailable. The account is still loaded; try Copy again.", ERR)
+            return False
         if announce:
             self._set_status("Copied to clipboard", OK)
             self.copy_btn.set_text("Copied!")
-            self.root.after(1200, lambda: self.copy_btn.set_text("Copy"))
+            if self._copy_reset_job is not None:
+                self.root.after_cancel(self._copy_reset_job)
+            self._copy_reset_job = self.root.after(1200, self._reset_copy_label)
+        return True
+
+    def _reset_copy_label(self):
+        self._copy_reset_job = None
+        self.copy_btn.set_text("Copy")
+
+    def _copy_shortcut(self, event):
+        if isinstance(event.widget, (tk.Entry, tk.Text)):
+            return
+        self._copy()
+        return "break"
+
+    def _paste_shortcut(self, event):
+        if isinstance(event.widget, (tk.Entry, tk.Text)):
+            return
+        try:
+            text = self.root.clipboard_get()
+        except tk.TclError:
+            text = ""
+        existing = self._token_dialog
+        self._open_token_dialog()
+        if existing is None and self._token_dialog is not None and text:
+            if len(text) <= 64 * 1024:
+                self._token_dialog.token.insert("1.0", text)
+        return "break"
+
+    def _escape(self, _=None):
+        if self._picker is not None:
+            return self._close_picker()
+        if self.active_tab == "settings":
+            self._select_tab("accounts")
+        else:
+            self._request_close()
+        return "break"
 
     # -- misc ----------------------------------------------------------------
     def _fit_and_center(self):
@@ -1636,6 +1894,8 @@ class App:
         self.viewport.yview_moveto(event.y / max(1, self.scrollbar.winfo_height()) - (last - first) / 2)
 
     def _scroll_content(self, event):
+        if event.widget is self.output and self.output.yview() != (0.0, 1.0):
+            return  # Text's own scrolling already handled this event.
         if self.viewport.yview() != (0.0, 1.0):
             direction = -1 if event.delta > 0 else 1
             self.viewport.yview_scroll(direction * max(1, abs(event.delta) // 120) * 2, "units")
@@ -1649,7 +1909,7 @@ def main():
     # If launched by dropping a file onto the .exe icon, process it immediately.
     for arg in sys.argv[1:]:
         if os.path.isfile(arg):
-            root.after(150, lambda p=arg: app.process(p))
+            root.after(150, lambda p=arg: app._start_extraction(p))
             break
 
     root.mainloop()
