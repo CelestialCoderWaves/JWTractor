@@ -18,22 +18,26 @@ def preferences_document(steam_id=DAVE):
             "FriendStoreLocalPrefs_" + account_id: json.dumps({"ePersonaState": 1, "strNonFriendsAllowedToMsg": "synthetic", "custom": {"keep": True}}),
             "FriendStoreLocalPrefs_999": '{"ePersonaState":1}',
             "Keep": "value"},
-        "friends": {"PersonaName": "synthetic"},
+        "friends": {"PersonaName": "synthetic", "AutoSignIntoFriends": "1", "PersonaStateDesired": "7"},
         "Software": {"Valve": {"Steam": {"apps": {"440": {"keep": "yes"}}}}}}}
 
 
-def test_private_login_changes_only_presence_and_streaming():
+@pytest.mark.parametrize("previous_presence", [1, 7])
+def test_private_login_changes_only_presence_and_streaming(previous_presence):
     before = preferences_document()
+    key = "FriendStoreLocalPrefs_" + str(int(DAVE) & 0xffffffff)
+    prefs = json.loads(before["UserLocalConfigStore"]["WebStorage"][key])
+    prefs["ePersonaState"] = previous_presence
+    before["UserLocalConfigStore"]["WebStorage"][key] = json.dumps(prefs)
     original = copy.deepcopy(before)
     after = sl.merge_private_login(before, DAVE)
     assert before == original
     root = after["UserLocalConfigStore"]
     assert root["streaming_v2"] == {"EnableStreaming": "0", "EnableHardwareEncoding": "1"}
-    key = "FriendStoreLocalPrefs_" + str(int(DAVE) & 0xffffffff)
     assert json.loads(root["WebStorage"][key]) == {
-        "ePersonaState": 7, "strNonFriendsAllowedToMsg": "synthetic", "custom": {"keep": True}}
-    for entry in ("friends", "Software"):
-        assert root[entry] == before["UserLocalConfigStore"][entry]
+        "ePersonaState": 0, "strNonFriendsAllowedToMsg": "synthetic", "custom": {"keep": True}}
+    assert root["friends"] == {"PersonaName": "synthetic", "AutoSignIntoFriends": "0", "PersonaStateDesired": "0"}
+    assert root["Software"] == before["UserLocalConfigStore"]["Software"]
     for entry in ("Keep", "FriendStoreLocalPrefs_999"):
         assert root["WebStorage"][entry] == before["UserLocalConfigStore"]["WebStorage"][entry]
     assert sl.merge_private_login(after, DAVE) == after
@@ -42,9 +46,13 @@ def test_private_login_changes_only_presence_and_streaming():
 def test_private_login_supports_missing_file_and_case_insensitive_vdf():
     after = sl.merge_private_login({}, DAVE)
     assert after["UserLocalConfigStore"]["streaming_v2"]["EnableStreaming"] == "0"
-    before = {"userlocalconfigstore": {"Streaming_V2": {"enablestreaming": "1"}}}
+    assert after["UserLocalConfigStore"]["friends"] == {"AutoSignIntoFriends": "0", "PersonaStateDesired": "0"}
+    before = {"userlocalconfigstore": {"Streaming_V2": {"enablestreaming": "1"},
+                                      "FRIENDS": {"AUTOSIGNINTOFRIENDS": "1", "PERSONASTATEDESIRED": "7", "Keep": "yes"}}}
     after = sl.merge_private_login(before, DAVE)
     assert after["userlocalconfigstore"]["Streaming_V2"] == {"enablestreaming": "0"}
+    assert after["userlocalconfigstore"]["FRIENDS"] == {
+        "AUTOSIGNINTOFRIENDS": "0", "PERSONASTATEDESIRED": "0", "Keep": "yes"}
     assert len(after) == 1
 
 
@@ -96,6 +104,20 @@ def test_invalid_preferences_fail_before_closing_steam(workflow):
     with pytest.raises(sl.SteamLoginError, match="friends preferences"):
         sl.login_account("dave", jwt({"sub": DAVE}), private_login=True)
     assert workflow.calls == []
+
+
+@pytest.mark.parametrize("name", ["AutoSignIntoFriends", "PersonaStateDesired"])
+def test_invalid_startup_preferences_fail_before_closing_steam(workflow, name):
+    path = selected_path(workflow)
+    path.parent.mkdir(parents=True)
+    doc = preferences_document()
+    doc["UserLocalConfigStore"]["friends"][name] = {"unexpected": "section"}
+    original = sl.serialize_vdf(doc).encode()
+    path.write_bytes(original)
+    with pytest.raises(sl.SteamLoginError, match="Friends & Chat startup preference"):
+        sl.login_account("dave", jwt({"sub": DAVE}), private_login=True)
+    assert workflow.calls == []
+    assert path.read_bytes() == original
 
 
 def test_failed_preferences_write_rolls_back_login_files(workflow, monkeypatch):

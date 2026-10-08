@@ -289,13 +289,19 @@ def merge_account(documents, steam_id, account_name, encrypted, timestamp):
 
 
 def merge_private_login(document, steam_id):
-    """Merge only this account's local presence and Remote Play preferences."""
+    """Start Friends & Chat signed out and disable this account's Remote Play."""
     account_id = str(int(steam_id) & 0xffffffff)
     result = copy.deepcopy(document)
     streaming = _section(result, "UserLocalConfigStore", "streaming_v2", create=True)
     if not isinstance(streaming.get(_key(streaming, "EnableStreaming"), "0"), str):
         raise SteamLoginError("Unexpected Remote Play preference type. No files were written.")
     _set(streaming, "EnableStreaming", "0")
+    friends = _section(result, "UserLocalConfigStore", "friends", create=True)
+    for name in ("AutoSignIntoFriends", "PersonaStateDesired"):
+        key = _key(friends, name)
+        if key in friends and not isinstance(friends[key], str):
+            raise SteamLoginError("Unexpected Friends & Chat startup preference type. No files were written.")
+        _set(friends, name, "0")
     storage = _section(result, "UserLocalConfigStore", "WebStorage", create=True)
     preference_key = _key(storage, "FriendStoreLocalPrefs_" + account_id)
     original = storage.get(preference_key, "{}")
@@ -313,7 +319,7 @@ def merge_private_login(document, steam_id):
             raise ValueError("Expected an object")
     except (TypeError, ValueError, RecursionError):
         raise SteamLoginError("Cannot read this account's friends preferences. No Steam configuration was changed.") from None
-    preferences["ePersonaState"] = 7  # Invisible: Steam stays connected.
+    preferences["ePersonaState"] = 0  # Offline in Friends & Chat; Steam login remains online.
     storage[preference_key] = json.dumps(preferences, separators=(",", ":"), ensure_ascii=False)
     # Verify that all other settings survive, including other JSON fields.
     restored = copy.deepcopy(result)
@@ -323,6 +329,13 @@ def merge_private_login(document, steam_id):
     if _key(old_streaming, "EnableStreaming") in old_streaming:
         old_key = _key(old_streaming, "EnableStreaming")
         restored_streaming[old_key] = old_streaming[old_key]
+    restored_friends = _section(restored, "UserLocalConfigStore", "friends")
+    old_friends = _section(document, "UserLocalConfigStore", "friends")
+    for name in ("AutoSignIntoFriends", "PersonaStateDesired"):
+        restored_friends.pop(_key(restored_friends, name))
+        if _key(old_friends, name) in old_friends:
+            old_key = _key(old_friends, name)
+            restored_friends[old_key] = old_friends[old_key]
     restored_storage = _section(restored, "UserLocalConfigStore", "WebStorage")
     restored_storage.pop(preference_key)
     old_storage = _section(document, "UserLocalConfigStore", "WebStorage")
@@ -717,7 +730,7 @@ def login_account(account_name, token, *, cancel=None, progress=None, private_lo
         for config, (_, merge) in zip(configs[3:], preference_merges):
             updated.append(merge(config.data))
         if private_login:
-            progress("Setting friends status to Invisible and disabling Remote Play…")
+            progress("Starting Friends & Chat offline and disabling Remote Play…")
         if disable_cloud_sync:
             progress("Disabling Steam Cloud Sync for the selected account…")
         if cs2_launch_options is not None:

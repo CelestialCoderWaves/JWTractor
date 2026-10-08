@@ -127,7 +127,7 @@ def test_private_login_toggle_is_remembered_and_passed_to_worker(window, monkeyp
     finish(window)
     assert received == [True]
     assert window.private_login_btn._enabled
-    assert "Remote Play off configured" in window.status.cget("text")
+    assert "Friends & Chat offline and Remote Play off configured" in window.status.cget("text")
 
 
 def test_toggle_save_failure_keeps_ui_and_store_in_sync(window, monkeypatch):

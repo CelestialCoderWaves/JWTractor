@@ -65,9 +65,11 @@ confirm Cloud is off in your client to verify the crash workaround.
 Steam documents the account-wide setting in its
 [Steam Cloud documentation](https://partner.steamgames.com/doc/features/cloud).
 
-Turn on **Appear offline & disable Remote Play** under **Settings → Login options** to
-start the selected account with **Invisible** friends status and Remote Play
-disabled. Steam stays connected so games, downloads, and the store still work.
+Turn on **Start Steam w/ Remote Play & Friends offline** under **Settings → Login options** to
+start the selected account signed out of Friends & Chat with Remote Play
+disabled. Automatic Friends & Chat sign-in is disabled for that account, with
+the desired and cached friends status set to Offline. Steam stays connected
+so games, downloads, and the store still work.
 This is a global login option: it applies to every account you log in to while
 enabled. JWTractor remembers the toggle between launches; it is off by default.
 

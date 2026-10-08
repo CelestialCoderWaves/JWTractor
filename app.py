@@ -808,8 +808,8 @@ class App:
                                              radius=20, inset=GAP)
         self.login_options_card.pack(padx=PAD)
         for index, (name, title, description, command) in enumerate((
-            ("private_login", "Appear offline & disable Remote Play",
-             "Every login while enabled. Steam stays connected.", self._toggle_private_login),
+            ("private_login", "Start Steam w/ Remote Play & Friends offline",
+             "Remote Play disabled. Games and downloads stay online.", self._toggle_private_login),
             ("disable_cloud_sync", "Disable Steam Cloud Sync",
              "Before every login. Game saves stay on this PC.", self._toggle_disable_cloud_sync),
         )):
@@ -1522,7 +1522,7 @@ class App:
                 elif sign_in == "other_account":
                     self._set_status("Steam signed in to a different account. Select the account you added in Steam.", "#facc15")
                 elif sign_in == "confirmed":
-                    options = " Invisible status and Remote Play off configured." if value.get("private_login") else ""
+                    options = " Friends & Chat offline and Remote Play off configured." if value.get("private_login") else ""
                     self._set_status(f"Signed in to Steam.{options}{cloud} {preserved}", OK)
                     steam_id = value.get("steam_id")
                     if steam_id:
