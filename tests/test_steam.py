@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -22,6 +23,7 @@ from steam import (  # noqa: E402
     list_backups,
     restore_backup,
     has_connect_cache,
+    _local_vdf_path,
 )
 
 SAMPLE_CONFIG_VDF = """\
@@ -98,6 +100,12 @@ def _isolate_dirs(tmp_path, monkeypatch):
     monkeypatch.setenv("LOCALAPPDATA", fake_local)
     if os.name != "nt":
         monkeypatch.setenv("XDG_CONFIG_HOME", fake_appdata)
+    # Backup/restore tests exercise a synthetic Windows local.vdf on every
+    # runner. Mock the platform-specific lookup rather than assuming that
+    # setting LOCALAPPDATA makes Linux discover a Windows credential file.
+    local_path = os.path.join(fake_local, "Steam", "local.vdf")
+    monkeypatch.setattr(steam_module, "_local_vdf_path",
+                        lambda: local_path if os.path.isfile(local_path) else None)
     # Unit tests must never read or write the user's real Steam registry state.
     monkeypatch.setattr(steam_module, "_read_registry_login_state", lambda: {})
     monkeypatch.setattr(steam_module, "_restore_registry_login_state", lambda state: [])
@@ -308,10 +316,29 @@ def test_list_backups_without_meta(tmp_path):
     assert "config.vdf" in keys
 
 
-def test_backup_dir_uses_appdata(monkeypatch):
-    monkeypatch.setenv("APPDATA", r"C:\Users\Test\AppData\Roaming")
-    expected = os.path.join(r"C:\Users\Test\AppData\Roaming", "JWTractor", "backups")
+@pytest.mark.parametrize("platform,variable", [("nt", "APPDATA"), ("posix", "XDG_CONFIG_HOME")])
+def test_backup_dir_uses_platform_config_directory(tmp_path, monkeypatch, platform, variable):
+    directories = {"APPDATA": str(tmp_path / "roaming"),
+                   "XDG_CONFIG_HOME": str(tmp_path / "xdg")}
+    monkeypatch.setattr(steam_module, "os", SimpleNamespace(
+        name=platform, environ=directories, path=os.path))
+    expected = os.path.join(directories[variable], "JWTractor", "backups")
     assert backup_dir() == expected
+
+
+@pytest.mark.parametrize("platform,exists,expected", [
+    ("nt", True, True), ("nt", False, False), ("posix", True, False),
+])
+def test_local_vdf_lookup_is_windows_only(tmp_path, monkeypatch, platform, exists, expected):
+    local = tmp_path / "localappdata"
+    path = local / "Steam" / "local.vdf"
+    if exists:
+        path.parent.mkdir(parents=True)
+        path.write_text(SAMPLE_LOCAL_VDF, encoding="utf-8")
+    monkeypatch.setattr(steam_module, "os", SimpleNamespace(
+        name=platform, environ={"LOCALAPPDATA": str(local)}, path=os.path))
+    # This reference is the actual resolver imported before the fixture mock.
+    assert _local_vdf_path() == (str(path) if expected else None)
 
 
 def test_partial_backup_only_existing_files(tmp_path):
