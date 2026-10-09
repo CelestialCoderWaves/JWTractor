@@ -116,6 +116,35 @@ def test_ordered_by_last_used(tmp_path):
     assert [a["id"] for a in store.ordered()] == [first["id"], second["id"]]
 
 
+def test_selection_persists_even_when_accounts_used_in_same_second(tmp_path, monkeypatch):
+    monkeypatch.setattr(time, "time", lambda: 1700000000)
+    store = Store(str(tmp_path / "accounts.json"))
+    alice = store.add(ACTIVE, "Alice")
+    bob = store.add(EXPIRED, "Bob")
+    assert store.ordered() == [bob, alice]
+    store.touch(alice["id"])
+    assert Store(store.path).selected_account_id == alice["id"]
+    store.remove(alice["id"])
+    assert Store(store.path).selected_account_id is None
+
+
+def test_selection_rolls_back_with_failed_account_mutation(tmp_path, monkeypatch):
+    store = Store(str(tmp_path / "accounts.json"))
+    alice = store.add(ACTIVE, "Alice")
+    bob = store.add(EXPIRED, "Bob")
+    def fail():
+        raise PermissionError("Synthetic save failure")
+    monkeypatch.setattr(store, "save", fail)
+    for operation, account in (("touch", alice), ("remove", bob)):
+        with pytest.raises(OSError):
+            getattr(store, operation)(account["id"])
+        assert store.selected_account_id == bob["id"]
+    with pytest.raises(OSError):
+        store.add(NO_EXP, "Third")
+    assert store.selected_account_id == bob["id"]
+    assert store.accounts == [alice, bob]
+
+
 def test_corrupt_file_starts_empty(tmp_path):
     path = tmp_path / "accounts.json"
     path.write_text("{ not valid json", encoding="utf-8")

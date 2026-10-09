@@ -18,14 +18,32 @@ app and standalone `.exe`; Node.js and SteamNFATool are not required.
 ## How it works
 
 Use the compact **Settings** button in the upper-left corner to manage login
-options. Preferences are saved automatically and apply to every selected
-account. Click **← Accounts** to return to extraction, saved accounts, and login
+options. **Default settings** apply to accounts that inherit them; **Selected
+account** lets you override individual options for that account. Changes are
+saved automatically. **Use defaults for this account** removes its overrides.
+Click **← Accounts** to return to extraction, saved accounts, and login
 actions. **Ctrl+Tab** switches views; the corner button also supports Enter,
 Space, and Left/Right.
 
-File imports run in the background, so the window stays responsive while an
-executable is being read. **Cancel import** discards the pending result without
-adding an account or changing your previous selection.
+JWTractor reopens your last selected account with its locally cached cooldown
+data. Reopening the app does not copy a token or start Steam login. The selected
+account and cooldown appear above the visible token; **Show token details**
+expands the decoded claims when you need them. The import area becomes compact
+once an account is selected, and empty token panels stay out of the way.
+
+The **Next login** summary above the login button shows the selected account's
+effective options, including overrides. Settings stay in the upper-left corner.
+The window can be resized; cards, text, and buttons adapt to its width, while
+long content scrolls and the action buttons remain visible. Your chosen window
+size is retained when switching tabs during the session.
+
+File imports run in the background. Browse for several executables, drop them
+together, or pass their paths to `app.py` to import a queue of up to 2,000 files.
+A per-file report shows added accounts, refreshed tokens, and failures; one
+failed file does not stop the queue. **Cancel import** retains completed saves
+and discards pending results. A failed import preserves the selected account,
+its token, and cached data. Account search keeps your query when you rename or
+delete an account.
 
 The account token is visible in the result card. **Copy** copies the full
 `username----token` string. A clipboard failure leaves the account saved and
@@ -38,7 +56,8 @@ offers a retry instead of reporting a successful copy.
 | **Ctrl+V** | Open the paste dialog with clipboard text; normal paste inside text fields. |
 | **Ctrl+C** | Copy the account result; normal copy inside text fields. |
 | **Ctrl+Tab** | Switch between Accounts and Settings. |
-| **Escape** | Close the account picker or return from Settings; otherwise close the app. |
+| **Escape** | Close the account picker, cancel a running import/login, or return from Settings. |
+| **Ctrl+Q** | Close the app, waiting for login cleanup when necessary. |
 
 Under **Settings → CS2 launch options**, enter your custom options and turn on
 **Use custom launch options**. The text is saved when you leave the field or
@@ -46,6 +65,9 @@ press Enter, and is applied to the selected account before Steam starts on
 each JWTractor login. Quotes and other arguments are preserved as entered.
 It replaces CS2's existing launch options; an enabled empty field clears them.
 The toggle is off by default and leaves Steam's current options alone when off.
+Unsaved edits are marked in Settings. **Revert changes** restores the last
+saved text; a validation or save error brings the field into view so you can
+correct it before leaving Settings or starting a login.
 These changes share the login backups and rollback and preserve other games
 and accounts. CS2 itself is not launched automatically. You can check the result
 in Steam's **CS2 → Properties → General → Launch Options**, as described in
@@ -70,8 +92,9 @@ start the selected account signed out of Friends & Chat with Remote Play
 disabled. Automatic Friends & Chat sign-in is disabled for that account, with
 the desired and cached friends status set to Offline. Steam stays connected
 so games, downloads, and the store still work.
-This is a global login option: it applies to every account you log in to while
-enabled. JWTractor remembers the toggle between launches; it is off by default.
+The default is off. Enable it in **Default settings** for accounts that inherit
+the option, or in **Selected account** for just that account. JWTractor remembers
+both defaults and overrides between launches.
 
 These settings are merged into the selected account's `localconfig.vdf` before
 Steam starts, with the same backups and rollback as the login configuration.
@@ -109,6 +132,8 @@ running it:
 | [`tests/test_steam_login.py`](tests/test_steam_login.py) | Login workflow and account-preservation tests using temporary files and synthetic tokens. |
 | [`tests/test_app_login.py`](tests/test_app_login.py) | Extraction, selection, login and cancellation UI tests with a mocked Steam backend. |
 | [`cooldown.py`](cooldown.py) | Reads matchmaking data through the signed-in Steam client and validates the account. |
+| [`presence.py`](presence.py) | Checks public Steam Friends status without credentials and keeps unavailable results distinct from Offline. |
+| [`diagnostics.py`](diagnostics.py) | Records a limited set of local error events and exports no tokens or account details. |
 | [`build.ps1`](build.ps1) | Builds the standalone `.exe` with PyInstaller. |
 | [`make_icon.py`](make_icon.py) | Build-time helper that draws the app/exe icon (`icon.ico`). |
 | [`requirements.txt`](requirements.txt) | Drag-and-drop and Steam page-interface dependencies. |
@@ -116,7 +141,9 @@ running it:
 Extraction only **reads** the file you give it. It never modifies, uploads,
 or executes that input. The optional Steam login action updates local Steam
 configuration and launches the installed Steam client. The optional cooldown
-check reads Steam Community through the already signed-in Steam client.
+check reads Steam Community through the already signed-in Steam client. Public
+online-status checks make anonymous HTTPS requests to Steam Community using
+the selected SteamID, without sending tokens or cookies.
 
 ## Quick start (from source)
 
@@ -137,6 +164,21 @@ to add a token that has already been extracted.
 > also get drag-and-drop directly into the window.
 
 ## Saved accounts
+
+Account details show **This PC** sign-in status separately from **Public Friends
+status**. The toolbar identifies the account currently signed into the local
+Steam client, and saved-account rows mark it. Local sign-in does not establish
+that Steam is connected to the internet.
+
+Public status distinguishes **Online**, **In game**, and **Appears offline**,
+with the last check's age. It refreshes automatically for the selected account
+about once a minute; **Refresh online status** requests an immediate check.
+Results are kept in memory, and older results are marked stale. Rate limits,
+private profiles, and unreadable responses produce an unavailable result rather
+than claiming the account is Offline. Steam's Invisible status can appear
+Offline. This uses Steam's documented legacy profile XML interface, which is
+deprecated and may be limited by privacy settings; see
+[Steam Community data documentation](https://partner.steamgames.com/documentation/community_data).
 
 Account **Details → CS2 matchmaking cooldown** reads the personal matchmaking
 page using the account already logged into the Windows Steam client. No separate
@@ -178,6 +220,12 @@ focused account (or the first match when searching). The list marks the selected
 account and expired tokens, and long account names wrap within their row.
 Renaming an account changes its display name without changing the login target.
 
+Importing a fresh Steam token for an existing SteamID refreshes the saved account
+instead of adding a duplicate. Its login name, alias, selection, account settings,
+and cached cooldown remain intact. A token with an older expiry cannot replace
+a newer saved token. Older duplicate records for the same account are consolidated
+when a refresh succeeds.
+
 - **Load** — click an account to put its `name----token` back in the box and copy it.
 - **Rename** — give an account a friendly **alias** (e.g. "main" or "burner"), so a
   cryptic username like a spam phone number is easy to recognise. The alias
@@ -186,9 +234,21 @@ Renaming an account changes its display name without changing the login target.
 
 Accounts are stored as plain JSON at `%APPDATA%\JWTractor\accounts.json` on
 Windows (`~/.config/JWTractor/accounts.json` elsewhere). **Treat that file as
-sensitive** — it holds real tokens, which are credentials. Delete it to wipe all
-saved accounts. Set the `JWTRACTOR_STORE` environment variable to keep it
-somewhere else.
+sensitive** — it holds real tokens, which are credentials. Set the
+`JWTRACTOR_STORE` environment variable to keep it somewhere else.
+
+Before each saved-data update, JWTractor keeps the previous valid snapshot in
+`accounts.json.bak`. Damaged or unsupported files are left intact and block writes
+until recovered. Under **Settings → Saved data & diagnostics → Recover backup**,
+choose a valid backup to restore accounts, defaults, overrides, and cached data.
+The existing file is preserved as `accounts-preserved-*.json` before replacement.
+These backups also contain credentials; removing saved data completely requires
+removing its backups as well.
+
+**Copy diagnostics** copies version information and recent local event names
+and exception types. The rotating `diagnostics.log` beside the accounts file
+excludes tokens, account names, SteamIDs, paths, exception messages, and page
+contents. Nothing is uploaded automatically.
 
 ## Add an already extracted token
 

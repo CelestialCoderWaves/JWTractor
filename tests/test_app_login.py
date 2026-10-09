@@ -28,6 +28,7 @@ def tk_root():
 def window(tmp_path, monkeypatch, tk_root):
     monkeypatch.setenv("JWTRACTOR_STORE", str(tmp_path / "accounts.json"))
     monkeypatch.setattr(gui, "current_steam_session", lambda: None)
+    monkeypatch.setattr(gui, "fetch_presence", lambda *a, **k: {"state": "unknown", "message": "Synthetic presence unavailable"})
     root = tk.Toplevel(tk_root)
     root.withdraw()
     # Extraction auto-copies; keep GUI tests off the user's real clipboard.
@@ -96,11 +97,17 @@ def test_extract_select_and_login_uses_original_username_not_alias(window, tmp_p
     assert "2 other remembered" in window.status.cget("text")
 
 
-def test_failed_extraction_clears_login_target(window, tmp_path):
-    window._use_account(window.store.add(jwt(), "alice"))
+def test_failed_extraction_preserves_selected_account_and_cached_details(window, tmp_path):
+    account = window.store.add(jwt(), "alice")
+    window.store.set_cooldown(account["subject"], {"state": "clear", "message": "Saved cooldown result"})
+    window._use_account(account)
+    original = window.result_text
     window.process(str(tmp_path / "missing.exe"))
-    assert window.current_account is None
-    assert not window.login_btn._enabled
+    assert window.current_account is account
+    assert window.result_text == original
+    assert "Saved cooldown result" in detail_text(window)
+    assert "Selected account unchanged" in window.status.cget("text")
+    assert window.login_btn._enabled == (os.name == "nt")
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Steam login button is Windows-only")
@@ -798,3 +805,329 @@ def test_find_accounts_from_settings_saves_draft_and_uses_existing_popup(window)
     assert window.store.preferences["cs2_launch_options"] == "-console"
     window._open_picker()
     assert window._picker is popup
+
+
+def test_startup_restores_selected_account_without_clipboard_or_login(window, monkeypatch):
+    alice = window.store.add(jwt(), "alice")
+    window.store.add(jwt({"sub": "76561198000000001"}), "bob")
+    window.store.touch(alice["id"])
+    monkeypatch.setattr(gui, "login_account", lambda *a, **k: pytest.fail("Startup must not sign in"))
+    root = tk.Toplevel(window.root)
+    root.withdraw()
+    monkeypatch.setattr(root, "clipboard_clear", lambda: pytest.fail("Startup must not copy"))
+    before = Path(window.store.path).read_bytes()
+    try:
+        restored = gui.App(root)
+        assert restored.current_account["id"] == alice["id"]
+        assert restored.result_text == gui.account_combined(alice)
+        assert restored._login_thread is None
+        assert Path(window.store.path).read_bytes() == before
+    finally:
+        root.destroy()
+
+
+def test_invalid_cs2_draft_can_be_reverted_and_navigation_recovers(window):
+    window._add_token("alice----" + jwt())
+    window.store.set_cs2_launch_options("-console")
+    window._revert_cs2_options()
+    window._select_tab("settings")
+    window.cs2_options_var.set("x" * 4097)
+    window._select_tab("accounts")
+    assert window.active_tab == "settings"
+    assert "4096" in window.cs2_options_status.cget("text")
+    assert window.cs2_revert_btn._enabled
+    window._revert_cs2_options()
+    assert window.cs2_launch_options_entry.get() == "-console"
+    assert not window.cs2_revert_btn._enabled
+    window._select_tab("accounts")
+    assert window.active_tab == "accounts"
+
+
+def test_failed_cs2_save_reveals_settings_from_account_login(window, monkeypatch):
+    window._add_token("alice----" + jwt())
+    window.cs2_options_var.set("-console")
+    monkeypatch.setattr(window.store, "save", lambda: (_ for _ in ()).throw(PermissionError("Synthetic failure")))
+    window._login_to_steam()
+    assert window._login_thread is None
+    assert window.active_tab == "settings"
+    assert "Could not save" in window.cs2_options_status.cget("text")
+
+
+def test_idle_escape_keeps_window_open_and_details_toggle_preserves_token(window):
+    window._add_token("alice----" + jwt())
+    original = window.result_text
+    window._escape()
+    assert window.root.winfo_exists()
+    assert not window._claims_expanded
+    window._toggle_claims()
+    assert "Issuer" in detail_text(window)
+    assert window.result_text == original
+    window._toggle_claims()
+    assert "Issuer" not in detail_text(window)
+    assert window.output.get("1.0", "end-1c") == original
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Steam login button is Windows-only")
+def test_cancellation_stays_disabled_after_switching_tabs(window, monkeypatch):
+    window._add_token("alice----" + jwt())
+    entered, release = threading.Event(), threading.Event()
+    def login(*args, cancel, **kwargs):
+        entered.set()
+        assert cancel.wait(2)
+        assert release.wait(2)
+        raise gui.LoginCancelled("Cancelled.")
+    monkeypatch.setattr(gui, "login_account", login)
+    window._login_to_steam()
+    wait_until_entered(window, entered)
+    window._escape()
+    window._select_tab("settings")
+    assert not window.login_btn._enabled
+    assert window.login_btn._text == "Cancelling…"
+    release.set()
+    finish(window)
+    assert window.status.cget("text") == "Cancelled."
+
+
+def test_search_survives_rename_and_login_summary_tracks_options(window):
+    account = window._add_token("alice----" + jwt())
+    assert window.login_summary.cget("text") == "Next login: Cloud off"
+    window._toggle_private_login()
+    assert "Friends offline · Remote Play off" in window.login_summary.cget("text")
+    window._open_picker()
+    window._picker.query.set("alice")
+    window._rename_account(account)
+    window._rename_dialog.alias.insert(0, "Main")
+    window._rename_dialog._submit()
+    assert window._picker.query.get() == "alice"
+    assert window._picker.matches == [account]
+
+
+def test_repeated_account_refreshes_release_native_images(window):
+    window._add_token("alice----" + jwt())
+    before = set(window.root.tk.call("image", "names"))
+    for _ in range(50):
+        window._refresh_cooldown_details()
+    after = set(window.root.tk.call("image", "names"))
+    # Only the current claims button can add images; destroyed controls must
+    # not accumulate native image handles in a long-running Steam session.
+    assert len(after) <= len(before) + 4
+
+
+def test_account_panels_and_import_strip_follow_selection_without_blank_token_card(window):
+    assert not window.token_heading.winfo_manager()
+    assert not window.result_card.winfo_manager()
+    assert not window.actions.winfo_manager()
+    initial_height = int(window.drop.cget("height"))
+    window._add_token("alice----" + jwt())
+    assert int(window.drop.cget("height")) < initial_height
+    assert window.result_card.winfo_manager()
+    assert window.actions.winfo_manager()
+    window.root.update_idletasks()
+    assert window.details_card.winfo_y() < window.token_heading.winfo_y()
+
+
+@pytest.mark.parametrize("scaling", [1.3333, 2.0])
+def test_settings_labels_fit_inside_cards_at_multiple_font_scales(window, scaling):
+    root = tk.Toplevel(window.root)
+    root.withdraw()
+    original_scaling = float(root.tk.call("tk", "scaling"))
+    try:
+        root.tk.call("tk", "scaling", scaling)
+        application = gui.App(root)
+        application._select_tab("settings")
+        root.update_idletasks()
+        for row in application.login_options_card.inner.winfo_children():
+            text, switch = [w for w in row.winfo_children() if isinstance(w, tk.Frame)][0], row.winfo_children()[0]
+            assert text.winfo_x() + text.winfo_width() <= switch.winfo_x()
+            for label in text.winfo_children():
+                assert label.winfo_width() <= text.winfo_width()
+        assert root.winfo_reqwidth() <= gui.WIN_W
+    finally:
+        root.destroy()
+        window.root.tk.call("tk", "scaling", original_scaling)
+
+
+def finish_import(application):
+    deadline = time.monotonic() + 4
+    while application._extraction is not None and time.monotonic() < deadline:
+        application.root.update()
+        time.sleep(0.01)
+    assert application._extraction is None
+
+
+def test_batch_import_reports_each_file_continues_after_failure_and_refreshes(window, tmp_path):
+    files = [tmp_path / name for name in ("alice.exe", "invalid.exe", "bob.exe", "renamed.exe")]
+    files[0].write_bytes(jwt({"exp": 2000000000}).encode())
+    files[1].write_bytes(b"no token here")
+    files[2].write_bytes(jwt({"sub": "76561198000000001"}).encode())
+    files[3].write_bytes(jwt({"exp": 2100000000, "jti": "new"}).encode())
+    window._start_imports([str(path) for path in files])
+    finish_import(window)
+    assert len(window.store.accounts) == 2
+    assert [result[2] for result in window._import_results] == [True, False, True, True]
+    assert window._import_results[-1][1] == "Refreshed"
+    assert window.current_account["username"] == "alice"
+    assert "invalid.exe" in window.import_report.get("1.0", "end-1c")
+    assert "3 saved, 1 failed" in window.status.cget("text")
+
+
+def test_batch_cancel_keeps_completed_saves_and_discards_late_result(window, monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+    def extract(path):
+        if path.endswith("second.exe"):
+            entered.set()
+            assert release.wait(3)
+            return gui.parse_token_input("bob----" + jwt({"sub": "76561198000000001"}))
+        return gui.parse_token_input("alice----" + jwt())
+    monkeypatch.setattr(gui, "extract_from_file", extract)
+    window._start_imports(["first.exe", "second.exe", "third.exe"])
+    wait_until_entered(window, entered)
+    worker = window._extraction[0]
+    window._cancel_extraction()
+    release.set()
+    worker.join(timeout=2)
+    window.root.update()
+    assert len(window.store.accounts) == 1
+    assert window.current_account["username"] == "alice"
+    assert [item[1] for item in window._import_results[1:]] == ["Skipped (cancelled)"] * 2
+    assert "1 completed file" in window.status.cget("text")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Steam login button is Windows-only")
+def test_selected_account_settings_are_used_even_when_default_settings_are_visible(window, monkeypatch):
+    alice = window._add_token("alice----" + jwt())
+    bob = window.store.add(jwt({"sub": "76561198000000001"}), "bob")
+    window._select_tab("settings")
+    window._edit_selected_settings()
+    window._toggle_private_login()
+    window.cs2_options_var.set("-console")
+    window._toggle_use_cs2_launch_options()
+    assert not window.store.preferences["private_login"]
+    window._change_settings_scope(None)
+    assert not window.private_login
+    received = []
+    def login(name, token, **options):
+        received.append((name, options["private_login"], options["cs2_launch_options"]))
+        return {"preserved_accounts": 0, "sign_in": "confirmed"}
+    monkeypatch.setattr(gui, "login_account", login)
+    window._select_tab("accounts")
+    assert "Friends offline" in window.login_summary.cget("text")
+    window._login_to_steam()
+    finish(window)
+    window._use_account(bob)
+    window._login_to_steam()
+    finish(window)
+    assert received == [("alice", True, "-console"), ("bob", False, None)]
+    window._use_account(alice)
+    window._edit_selected_settings()
+    window._reset_profile()
+    assert window.store.effective_preferences(alice["id"]) == window.store.preferences
+
+
+def test_local_session_status_tracks_matching_other_and_closed_steam(window, monkeypatch):
+    alice = window._add_token("alice----" + jwt())
+    bob = window.store.add(jwt({"sub": "76561198000000001"}), "bob")
+    monkeypatch.setattr(window, "_check_cooldown", lambda *a, **k: None)
+    monkeypatch.setattr(gui, "current_steam_session", lambda: (alice["subject"], 123))
+    window._watch_steam_session()
+    assert "Signed into this account" in detail_text(window)
+    window._use_account(bob)
+    assert "another account" in detail_text(window)
+    monkeypatch.setattr(gui, "current_steam_session", lambda: None)
+    window._watch_steam_session()
+    assert "No active Steam sign-in" in detail_text(window)
+
+
+def test_presence_result_stays_with_its_account_and_unknown_does_not_claim_offline(window):
+    alice = window._add_token("alice----" + jwt())
+    window._stop_presence_check()
+    events = gui.queue.Queue()
+    events.put({"state": "online", "message": "Online", "checked_at": int(time.time())})
+    window._presence_worker = (alice["subject"], threading.Event(), events, None)
+    window._poll_presence()
+    assert "Public Friends status: Online" in detail_text(window)
+    bob = window.store.add(jwt({"sub": "76561198000000001"}), "bob")
+    window._use_account(bob)
+    assert "Public Friends status: Online" not in detail_text(window)
+    window._stop_presence_check()
+    events = gui.queue.Queue()
+    events.put({"state": "unknown", "message": "Private profile", "checked_at": int(time.time())})
+    window._presence_worker = (bob["subject"], threading.Event(), events, None)
+    window._poll_presence()
+    assert "Public Friends status: Private profile" in detail_text(window)
+    assert "Public Friends status: Appears offline" not in detail_text(window)
+
+
+def test_recovery_ui_restores_selection_and_preserves_current_file(window, monkeypatch):
+    alice = window._add_token("alice----" + jwt())
+    window.store.set_alias(alice["id"], "Restored alias")
+    window.store.save()
+    backup = window.store.path + ".bak"
+    Path(window.store.path).write_bytes(b"damaged saved data")
+    monkeypatch.setattr(gui.filedialog, "askopenfilename", lambda **k: backup)
+    monkeypatch.setattr(gui.messagebox, "askyesno", lambda *a, **k: True)
+    window._recover_data()
+    assert window.current_account["alias"] == "Restored alias"
+    assert "Backup restored" in window.data_status.cget("text")
+    preserved = list(Path(window.store.path).parent.glob("accounts-preserved-*.json"))
+    assert preserved[0].read_bytes() == b"damaged saved data"
+
+
+@pytest.mark.parametrize("width", [540, 840])
+def test_manual_resize_reflows_cards_and_keeps_actions_visible(window, width):
+    window._add_token("alice----" + jwt())
+    window.root.deiconify()
+    window.root.geometry(f"{width}x650")
+    window.root.update()
+    window._apply_resize()
+    window.root.update_idletasks()
+    assert window._content_width == width - 2 * gui.PAD
+    assert window.details_card.winfo_width() == width - 2 * gui.PAD
+    assert window.login_btn.winfo_rootx() + window.login_btn.winfo_width() <= window.root.winfo_rootx() + width - gui.PAD
+    assert window.login_btn.winfo_rooty() + window.login_btn.winfo_height() <= window.root.winfo_rooty() + 650 - gui.PAD
+    window._select_tab("settings")
+    window.root.update()
+    assert window.root.winfo_width() == width and window.root.winfo_height() == 650
+    assert window.viewport.yview()[1] < 1
+
+
+def test_new_claims_fit_after_resizing_to_minimum_width(window):
+    window._add_token("alice----" + jwt())
+    window.root.deiconify()
+    window.root.geometry("520x650")
+    window.root.update()
+    window._apply_resize()
+    window._toggle_claims()
+    window.root.update_idletasks()
+    inner = window.details_inner
+    for widget in inner.winfo_children():
+        if isinstance(widget, tk.Label) and widget.grid_info().get("column") == 1:
+            assert widget.winfo_x() + widget.winfo_width() <= inner.winfo_width()
+            assert widget.winfo_reqwidth() <= widget.winfo_width()
+
+
+def test_batch_selection_updates_the_account_settings_scope(window, monkeypatch):
+    window._add_token("alice----" + jwt())
+    window._edit_selected_settings()
+    monkeypatch.setattr(gui, "extract_from_file", lambda _: gui.parse_token_input(
+        "bob----" + jwt({"sub": "76561198000000001"})))
+    window._start_imports(["bob.exe"])
+    finish_import(window)
+    assert window.current_account["username"] == "bob"
+    assert window._settings_account_id == window.current_account["id"]
+    assert "Editing bob" in window.settings_scope_note.cget("text")
+
+
+def test_old_online_result_is_marked_stale_and_refresh_requests_are_throttled(window, monkeypatch):
+    account = window._add_token("alice----" + jwt())
+    window._stop_presence_check()
+    window._presence[account["subject"]] = {"state": "online", "message": "Online",
+                                          "checked_at": int(time.time()) - 100}
+    window._update_presence_label()
+    assert "Last known" in window.public_presence_label.cget("text")
+    assert "stale" in window.public_presence_label.cget("text")
+    assert window.public_presence_label.cget("fg") == gui.FG_MUTED
+    window._presence[account["subject"]]["checked_at"] = int(time.time())
+    monkeypatch.setattr(gui, "fetch_presence", lambda *_: pytest.fail("Fresh result was fetched again"))
+    window._ensure_presence()
+    assert window._presence_worker is None

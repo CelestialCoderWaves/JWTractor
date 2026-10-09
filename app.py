@@ -27,6 +27,8 @@ from tkinter import filedialog, messagebox
 from datetime import datetime, timezone
 
 from cooldown import check_client_cooldown, current_steam_session
+from diagnostics import Diagnostics
+from presence import fetch_presence
 
 from extractor import (
     ExtractionError,
@@ -109,16 +111,30 @@ def _paint_surface(canvas, width, height, radius, fill, border, tags="shape"):
     for sprite, (x, y) in zip(sprites[:4], ((0, 0), (width - corner, 0),
                                           (0, height - corner), (width - corner, height - corner))):
         canvas.create_image(x, y, anchor="nw", image=sprite, tags=tags)
-    canvas._surface_edges = [sprites[4].zoom(width - 2 * corner, 1),
-                             sprites[5].zoom(width - 2 * corner, 1),
-                             sprites[6].zoom(1, height - 2 * corner),
-                             sprites[7].zoom(1, height - 2 * corner)]
+    edge_key = (key, width, height)
+    if getattr(canvas, "_surface_edge_key", None) != edge_key:
+        canvas._surface_edges = [sprites[4].zoom(width - 2 * corner, 1),
+                                 sprites[5].zoom(width - 2 * corner, 1),
+                                 sprites[6].zoom(1, height - 2 * corner),
+                                 sprites[7].zoom(1, height - 2 * corner)]
+        canvas._surface_edge_key = edge_key
     for sprite, (x, y) in zip(canvas._surface_edges, ((corner, 0), (corner, height - corner),
                                                     (0, corner), (width - corner, corner))):
         canvas.create_image(x, y, anchor="nw", image=sprite, tags=tags)
 
 
-class RoundedButton(tk.Canvas):
+class GraphicCanvas(tk.Canvas):
+    """Release native image resources when a control is destroyed."""
+
+    def destroy(self):
+        super().destroy()
+        for name in ("_surface_images", "_surface_edges", "_icons", "_switch_images"):
+            cache = getattr(self, name, None)
+            if cache is not None:
+                cache.clear()
+
+
+class RoundedButton(GraphicCanvas):
     """A flat, rounded button drawn on a Canvas (crisp text, real hover states)."""
 
     def __init__(
@@ -226,6 +242,11 @@ class RoundedButton(tk.Canvas):
 
     def set_text(self, text):
         self._text = text
+        self._render()
+
+    def set_width(self, width):
+        self._cw = max(1, int(width))
+        self.configure(width=self._cw)
         self._render()
 
 
@@ -382,7 +403,7 @@ class TokenDialog(tk.Toplevel):
         return "break"
 
 
-class RoundedCard(tk.Canvas):
+class RoundedCard(GraphicCanvas):
     """A rounded, bordered panel that hosts child widgets in ``self.inner``.
 
     The width is fixed; the height is not baked in — call ``fit()`` after the
@@ -421,6 +442,12 @@ class RoundedCard(tk.Canvas):
         height = max(min_height, self.inner.winfo_reqheight() + 2 * self.inset)
         self.configure(height=height)
         self._paint(height)
+
+    def set_width(self, width):
+        self._card_w = max(2 * self.inset + 1, int(width))
+        self.configure(width=self._card_w)
+        self.itemconfigure(self._win, width=self._card_w - 2 * self.inset)
+        self.fit()
 
 
 class RenameDialog(tk.Toplevel):
@@ -514,7 +541,7 @@ class RenameDialog(tk.Toplevel):
         return "break"
 
 
-class DropZone(tk.Canvas):
+class DropZone(GraphicCanvas):
     """A rounded, clickable drop target with an icon and a hover state."""
 
     def __init__(self, parent, width, height, on_click, *, dnd=False):
@@ -523,6 +550,8 @@ class DropZone(tk.Canvas):
             bg=parent.cget("bg"), highlightthickness=0, bd=0,
         )
         self._cw, self._ch = width, height
+        self._regular_height = height
+        self._compact = False
         self._on_click = on_click
         self._dnd = dnd
         self._hover = False
@@ -564,6 +593,17 @@ class DropZone(tk.Canvas):
         self._reading = bool(on)
         self._render()
 
+    def set_compact(self, on):
+        self._compact = bool(on)
+        self._ch = 76 if on else self._regular_height
+        self.configure(height=self._ch)
+        self._render()
+
+    def set_width(self, width):
+        self._cw = max(1, int(width))
+        self.configure(width=self._cw)
+        self._render()
+
     def _render(self):
         self.delete("all")
         hover = self._hover and self._enabled
@@ -571,6 +611,16 @@ class DropZone(tk.Canvas):
         border = FG if self._focused and self._enabled else ACCENT if hover else DROP_BORDER
         icon = ACCENT if hover else FG_FAINT
         _paint_surface(self, self._cw, self._ch, 16, fill, border)
+        if self._compact:
+            self._icon(32, self._ch / 2, icon)
+            self.create_text(64, self._ch / 2 - 11, anchor="w",
+                             text="Reading executable…" if self._reading else "Import another executable",
+                             fill=FG, font=("Segoe UI Semibold", 11))
+            self.create_text(64, self._ch / 2 + 11, anchor="w",
+                             text="You can cancel the import below." if self._reading else
+                                  "Drag an .exe here or click to browse" if self._dnd else "Click to choose an .exe",
+                             fill=FG_MUTED, font=("Segoe UI", 9))
+            return
         cx = self._cw / 2
         self._icon(cx, 0, icon)
         line1 = "Drag an .exe here" if self._dnd else "Click to choose an .exe"
@@ -632,9 +682,15 @@ def _draw_logo(canvas, s):
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
+        self._content_width = CONTENT_W
+        self._manual_size = None
+        self._auto_geometry = None
+        self._resize_job = None
+        self._layout_running = False
         root.title(APP_TITLE)
         root.configure(bg=BG)
-        root.resizable(False, False)
+        root.resizable(True, True)
+        root.minsize(520, min(420, max(260, root.winfo_screenheight() - 160)))
         try:  # custom title-bar / taskbar icon when icon.ico is present
             root.iconbitmap(_resource("icon.ico"))
         except Exception:  # pragma: no cover - falls back to the default icon
@@ -643,6 +699,15 @@ class App:
         self.result_text = ""  # the current "name----token" string
         self._copy_reset_job = None
         self.store = Store()  # saved accounts (tokens + aliases) on disk
+        self.diagnostics = Diagnostics(os.path.dirname(os.path.abspath(self.store.path)))
+        self.diagnostics.record("startup")
+        self._settings_account_id = None
+        self._presence = {}
+        self._presence_worker = None
+        self._presence_poll_job = None
+        self._observed_session = current_steam_session()
+        self._import_results = []
+        self._import_paths = []
         self.private_login = self.store.preferences["private_login"]
         self.disable_cloud_sync = self.store.preferences["disable_cloud_sync"]
         self.use_cs2_launch_options = self.store.preferences["use_cs2_launch_options"]
@@ -651,7 +716,9 @@ class App:
         self._picker_closed_at = 0.0
         self._token_dialog = None
         self._rename_dialog = None
+        self._account_query = ""
         self._login_thread = None
+        self._login_poll_job = None
         self._extraction = None
         self._extraction_poll_job = None
         self._login_cancel = threading.Event()
@@ -661,13 +728,18 @@ class App:
         self._cooldown_poll_job = None
         self._cooldown_notice = {}
         self._detail_rows = []
+        self._claims_expanded = False
         self.cooldown_btn = None
         self._steam_session_seen = None
         self._steam_watch_job = None
 
         self._build_ui()
+        self._restore_selection()
+        if self.store.load_error:
+            self._set_status(self.store.load_error, ERR)
         self._fit_and_center()  # size the window to its content, then centre
         _use_dark_titlebar(root)
+        root.bind("<Configure>", self._on_root_resize, add="+")
 
         # Text fields retain their native copy/paste behavior.
         root.bind("<Control-c>", self._copy_shortcut)
@@ -675,12 +747,14 @@ class App:
         root.bind("<Control-o>", lambda _: self._browse())
         root.bind("<Control-k>", lambda _: self._open_picker())
         root.bind("<Control-v>", self._paste_shortcut)
+        root.bind("<Control-q>", self._request_close)
         root.protocol("WM_DELETE_WINDOW", self._request_close)
         root.bind("<MouseWheel>", self._scroll_content)
         root.bind("<Control-Tab>", self._cycle_tab)
         root.bind("<Control-Shift-Tab>", self._cycle_tab)
         root.bind("<Destroy>", self._stop_steam_watch, add="+")
         self._steam_watch_job = root.after(1500, self._watch_steam_session)
+        root.report_callback_exception = self._ui_exception
 
         if _DND_AVAILABLE:
             self.drop.drop_target_register(DND_FILES)
@@ -718,6 +792,10 @@ class App:
         self.settings_btn.pack(side="left")
         self.settings_btn.bind("<Left>", lambda _: self._select_tab("accounts"))
         self.settings_btn.bind("<Right>", lambda _: self._select_tab("settings"))
+        self.steam_status = tk.Label(toolbar, bg=BG, fg=FG_MUTED, font=("Segoe UI", 9),
+                                     anchor="e", justify="right", wraplength=self._content_width - 124)
+        self.steam_status.pack(side="right")
+        self._update_session_labels()
 
         # header: logo tile + title/subtitle
         header = tk.Frame(self.root, bg=BG)
@@ -727,28 +805,38 @@ class App:
         _draw_logo(logo, 46)
 
         titles = tk.Frame(header, bg=BG)
-        titles.pack(side="left", padx=(GAP, 0))
+        self.header_titles = titles
+        titles.pack(side="left", fill="x", expand=True, padx=(GAP, GAP))
         tk.Label(
             titles, text=APP_TITLE, bg=BG, fg=FG, font=("Segoe UI Semibold", 19)
         ).pack(anchor="w")
         self.subtitle = tk.Label(
             titles, text="Extract or paste a token, then log in.",
-            bg=BG, fg=FG_MUTED, font=("Segoe UI", 10),
+            bg=BG, fg=FG_MUTED, font=("Segoe UI", 10), anchor="w", justify="left",
+            wraplength=self._content_width - 46 - 2 * GAP - 132,
         )
         self.subtitle.pack(anchor="w", pady=(GAP, 0))
         self.paste_btn = RoundedButton(header, "Paste token", self._open_token_dialog,
                                        style="secondary", min_width=132, pad_x=GAP)
-        self.paste_btn.pack(side="right")
+        self.paste_btn.pack(side="right", before=titles)
 
         # drop zone
-        self.drop = DropZone(self.content, CONTENT_W, 130, self._browse, dnd=_DND_AVAILABLE)
+        self.drop = DropZone(self.content, self._content_width, 130, self._browse, dnd=_DND_AVAILABLE)
         self.drop.pack(padx=PAD, pady=(GAP, 0))
+        self.import_card = RoundedCard(self.content, self._content_width, fill=SURFACE, inset=GAP)
+        tk.Label(self.import_card.inner, text="IMPORT RESULTS", bg=SURFACE, fg=FG_MUTED,
+                 font=("Segoe UI", 9, "bold")).pack(anchor="w")
+        self.import_report = tk.Text(self.import_card.inner, height=4, width=1, bg=SURFACE, fg=FG,
+                                     font=("Segoe UI", 9), wrap="word", relief="flat", bd=0,
+                                     highlightthickness=0, selectbackground=ACCENT_LO)
+        self.import_report.pack(fill="x", pady=(GAP, 0))
+        self.import_report.configure(state="disabled")
 
         # saved accounts — pick one you've pulled before
         self._section("SAVED ACCOUNTS").pack(fill="x", padx=PAD, pady=GAP)
         self.saved_btn = RoundedButton(
             self.content, self._saved_btn_text(), self._toggle_picker,
-            style="secondary", min_width=CONTENT_W,
+            style="secondary", min_width=self._content_width,
         )
         self.saved_btn.pack(padx=PAD)
 
@@ -756,9 +844,16 @@ class App:
 
         self._build_settings()
 
+        self.details_heading = self._section("SELECTED ACCOUNT")
+        self.details_heading.pack(fill="x", padx=PAD, pady=GAP)
+        self.details_card = RoundedCard(self.content, self._content_width, fill=SURFACE, border=BORDER, inset=GAP)
+        self.details_card.pack(padx=PAD)
+        self.details_inner = self.details_card.inner
+
         # result
-        self._section("ACCOUNT TOKEN").pack(fill="x", padx=PAD, pady=GAP)
-        self.result_card = RoundedCard(self.content, CONTENT_W, fill=FIELD, border=BORDER, inset=GAP)
+        self.token_heading = self._section("ACCOUNT TOKEN")
+        self.token_heading.pack(fill="x", padx=PAD, pady=GAP)
+        self.result_card = RoundedCard(self.content, self._content_width, fill=FIELD, border=BORDER, inset=GAP)
         self.result_card.pack(padx=PAD)
         self._text_padx = 0
         self.output = tk.Text(
@@ -768,19 +863,15 @@ class App:
         )
         self.output.pack(fill="x")
 
-        # details (decoded claims)
-        self._section("DETAILS").pack(fill="x", padx=PAD, pady=GAP)
-        self.details_card = RoundedCard(self.content, CONTENT_W, fill=SURFACE, border=BORDER, inset=GAP)
-        self.details_card.pack(padx=PAD)
-        self.details_inner = self.details_card.inner
-
         # footer: actions above a wrapping status line
         self.footer = footer = tk.Frame(self.root, bg=BG)
         footer.pack(side="bottom", before=self.viewport, fill="x", padx=PAD, pady=(GAP, PAD))
+        self.login_summary = tk.Label(footer, bg=BG, fg=FG_MUTED, font=("Segoe UI", 9),
+                                      wraplength=self._content_width, justify="left", anchor="w")
         self.actions = actions = tk.Frame(footer, bg=BG)
         actions.pack(fill="x")
 
-        action_width = (CONTENT_W - GAP) // 2
+        action_width = (self._content_width - GAP) // 2
         self.copy_btn = RoundedButton(actions, "Copy", self._copy, style="secondary", min_width=action_width)
         self.copy_btn.pack(side="left")
         self.copy_btn.set_enabled(False)
@@ -789,22 +880,41 @@ class App:
         self.login_btn.set_enabled(False)
 
         self.status = tk.Label(footer, text="", bg=BG, fg=FG_MUTED, font=("Segoe UI", 9),
-                               wraplength=CONTENT_W, justify="left", anchor="w")
+                               wraplength=self._content_width, justify="left", anchor="w")
 
         # initial (empty) content — also sizes the two cards to their placeholders
         self._set_output("")
         self._set_details([])
+        self._refresh_login_action()
 
     def _build_settings(self):
         tk.Label(self.settings_content, text="Settings", bg=BG, fg=FG,
                  font=("Segoe UI Semibold", 17), anchor="w").pack(fill="x", padx=PAD, pady=(GAP, 0))
-        tk.Label(self.settings_content, text="Saved automatically. Applies to every account you log in to.",
+        tk.Label(self.settings_content, text="Choose defaults or customize the selected account. Changes are saved automatically.",
                  bg=BG, fg=FG_MUTED, font=("Segoe UI", 10), anchor="w",
-                 wraplength=CONTENT_W, justify="left").pack(fill="x", padx=PAD, pady=(GAP, 0))
+                 wraplength=self._content_width, justify="left").pack(fill="x", padx=PAD, pady=(GAP, 0))
+        scope = tk.Frame(self.settings_content, bg=BG)
+        scope.pack(fill="x", padx=PAD, pady=(GAP, 0))
+        scope_width = (self._content_width - GAP) // 2
+        self.defaults_scope_btn = RoundedButton(scope, "Default settings", lambda: self._change_settings_scope(None),
+                                                style="secondary", height=32, min_width=scope_width)
+        self.defaults_scope_btn.pack(side="left")
+        self.account_scope_btn = RoundedButton(scope, "Selected account", self._edit_selected_settings,
+                                               style="secondary", height=32, min_width=scope_width)
+        self.account_scope_btn.pack(side="right")
+        self.settings_scope_note = tk.Label(self.settings_content,
+                                            text="Editing defaults. Accounts without custom settings inherit these options.",
+                                            bg=BG, fg=FG_MUTED, font=("Segoe UI", 9), wraplength=self._content_width,
+                                            anchor="w", justify="left")
+        self.settings_scope_note.pack(fill="x", padx=PAD, pady=(GAP, 0))
+        self.reset_profile_btn = RoundedButton(self.settings_content, "Use defaults for this account", self._reset_profile,
+                                               style="secondary", height=32, pad_x=GAP)
+        self.reset_profile_btn.pack(anchor="w", padx=PAD, pady=(GAP, 0))
+        self.reset_profile_btn.set_enabled(False)
         option_heading = self._section("LOGIN OPTIONS", self.settings_content)
         option_heading.configure(fg=FG_MUTED)
         option_heading.pack(fill="x", padx=PAD, pady=GAP)
-        self.login_options_card = RoundedCard(self.settings_content, CONTENT_W, fill=SURFACE, border=BORDER,
+        self.login_options_card = RoundedCard(self.settings_content, self._content_width, fill=SURFACE, border=BORDER,
                                              radius=20, inset=GAP)
         self.login_options_card.pack(padx=PAD)
         for index, (name, title, description, command) in enumerate((
@@ -822,16 +932,18 @@ class App:
             text = tk.Frame(row, bg=SURFACE)
             text.pack(side="left", fill="x", expand=True)
             tk.Label(text, text=title, bg=SURFACE, fg=FG,
-                     font=("Segoe UI Semibold", 10)).pack(anchor="w")
+                     font=("Segoe UI Semibold", 10), anchor="w", justify="left",
+                     wraplength=self._content_width - 2 * GAP - 70 - GAP).pack(fill="x")
             tk.Label(text, text=description, bg=SURFACE, fg=FG_MUTED,
-                     font=("Segoe UI", 9)).pack(anchor="w", pady=(GAP, 0))
+                     font=("Segoe UI", 9), anchor="w", justify="left",
+                     wraplength=self._content_width - 2 * GAP - 70 - GAP).pack(fill="x", pady=(GAP, 0))
         self.login_options_card.fit()
         tk.Label(self.settings_content, text="Turning an option off leaves Steam’s current settings in place.",
-                 bg=BG, fg=FG_FAINT, font=("Segoe UI", 9), wraplength=CONTENT_W,
+                 bg=BG, fg=FG_FAINT, font=("Segoe UI", 9), wraplength=self._content_width,
                  justify="left", anchor="w").pack(fill="x", padx=PAD, pady=(GAP, 0))
 
         self._section("CS2 LAUNCH OPTIONS", self.settings_content).pack(fill="x", padx=PAD, pady=GAP)
-        self.cs2_options_card = RoundedCard(self.settings_content, CONTENT_W, fill=SURFACE,
+        self.cs2_options_card = RoundedCard(self.settings_content, self._content_width, fill=SURFACE,
                                            border=BORDER, radius=20, inset=GAP)
         self.cs2_options_card.pack(padx=PAD)
         row = tk.Frame(self.cs2_options_card.inner, bg=SURFACE)
@@ -843,35 +955,154 @@ class App:
         tk.Label(row, text="Use custom launch options", bg=SURFACE, fg=FG,
                  font=("Segoe UI Semibold", 10)).pack(side="left")
         tk.Label(self.cs2_options_card.inner, text="Replaces CS2 launch options for the selected account at login.",
-                 bg=SURFACE, fg=FG_MUTED, font=("Segoe UI", 9), wraplength=CONTENT_W - 2 * GAP,
+                 bg=SURFACE, fg=FG_MUTED, font=("Segoe UI", 9), wraplength=self._content_width - 2 * GAP,
                  anchor="w", justify="left").pack(fill="x", pady=(GAP, 0))
-        self.cs2_options_field = RoundedCard(self.cs2_options_card.inner, CONTENT_W - 2 * GAP,
+        self.cs2_options_field = RoundedCard(self.cs2_options_card.inner, self._content_width - 2 * GAP,
                                             fill=FIELD, border=BORDER, radius=12, inset=GAP)
         self.cs2_options_field.pack(fill="x", pady=(GAP, 0))
-        self.cs2_launch_options_entry = tk.Entry(self.cs2_options_field.inner, bg=FIELD, fg=FG,
+        self.cs2_options_var = tk.StringVar(master=self.root, value=self.store.preferences["cs2_launch_options"])
+        self.cs2_launch_options_entry = tk.Entry(self.cs2_options_field.inner, textvariable=self.cs2_options_var,
+                                                bg=FIELD, fg=FG,
                                                 insertbackground=FG, selectbackground=ACCENT_LO,
                                                 disabledbackground=FIELD, disabledforeground=FG_FAINT,
                                                 font=("Consolas", 10), relief="flat", bd=0)
         self.cs2_launch_options_entry.pack(fill="x")
-        self.cs2_launch_options_entry.insert(0, self.store.preferences["cs2_launch_options"])
         self.cs2_launch_options_entry.bind("<FocusIn>", lambda _: self._focus_cs2_options(True))
         self.cs2_launch_options_entry.bind("<FocusOut>", lambda _: self._save_cs2_launch_options())
         self.cs2_launch_options_entry.bind("<Return>", self._save_cs2_launch_options_on_enter)
         self.cs2_options_field.fit()
         tk.Label(self.cs2_options_card.inner, text="Blank clears CS2 options when enabled. Off leaves Steam’s options alone.",
-                 bg=SURFACE, fg=FG_MUTED, font=("Segoe UI", 9), wraplength=CONTENT_W - 2 * GAP,
+                 bg=SURFACE, fg=FG_MUTED, font=("Segoe UI", 9), wraplength=self._content_width - 2 * GAP,
                  anchor="w", justify="left").pack(fill="x", pady=(GAP, 0))
         self.cs2_options_status = tk.Label(self.cs2_options_card.inner, text="Saved when you leave the field or press Enter.",
                                          bg=SURFACE, fg=FG_FAINT, font=("Segoe UI", 9),
-                                         anchor="w", justify="left", wraplength=CONTENT_W - 2 * GAP)
+                                         anchor="w", justify="left", wraplength=self._content_width - 2 * GAP)
         self.cs2_options_status.pack(fill="x", pady=(GAP, 0))
+        self.cs2_revert_btn = RoundedButton(self.cs2_options_card.inner, "Revert changes", self._revert_cs2_options,
+                                           style="secondary", height=32, pad_x=GAP)
+        self.cs2_revert_btn.pack(anchor="w", pady=(GAP, 0))
+        self.cs2_revert_btn.set_enabled(False)
+        self.cs2_options_var.trace_add("write", self._cs2_draft_changed)
         self.cs2_options_card.fit()
+        self._section("SAVED DATA & DIAGNOSTICS", self.settings_content).pack(fill="x", padx=PAD, pady=GAP)
+        self.data_card = RoundedCard(self.settings_content, self._content_width, fill=SURFACE, inset=GAP)
+        self.data_card.pack(padx=PAD)
+        self.data_status = tk.Label(self.data_card.inner, text=self.store.load_error or
+                                    "A validated backup is kept before saved accounts or settings are updated.",
+                                    bg=SURFACE, fg=ERR if self.store.load_error else FG_MUTED,
+                                    font=("Segoe UI", 9), wraplength=self._content_width - 2 * GAP, anchor="w", justify="left")
+        self.data_status.pack(fill="x")
+        self.recover_btn = RoundedButton(self.data_card.inner, "Recover backup", self._recover_data,
+                                         style="secondary", height=32, pad_x=GAP)
+        self.recover_btn.pack(anchor="w", pady=(GAP, 0))
+        tk.Label(self.data_card.inner, text="Diagnostics contain local error events only. Tokens, account details and page contents are excluded.",
+                 bg=SURFACE, fg=FG_MUTED, font=("Segoe UI", 9), wraplength=self._content_width - 2 * GAP,
+                 anchor="w", justify="left").pack(fill="x", pady=(GAP, 0))
+        self.diagnostics_btn = RoundedButton(self.data_card.inner, "Copy diagnostics", self._copy_diagnostics,
+                                             style="secondary", height=32, pad_x=GAP)
+        self.diagnostics_btn.pack(anchor="w", pady=(GAP, 0))
+        self.data_card.fit()
+
+    def _settings_values(self):
+        return self.store.effective_preferences(self._settings_account_id)
+
+    def _edit_selected_settings(self):
+        if self.current_account:
+            self._change_settings_scope(self.current_account["id"])
+
+    def _change_settings_scope(self, account_id, *, save=True):
+        if self._login_thread is not None or self._extraction is not None:
+            return
+        if save and not self._save_cs2_launch_options():
+            self._reveal_cs2_error()
+            return
+        self._settings_account_id = account_id
+        values = self._settings_values()
+        for name in ("private_login", "disable_cloud_sync", "use_cs2_launch_options"):
+            setattr(self, name, values[name])
+            getattr(self, name + "_btn").set_checked(values[name])
+        self.cs2_options_var.set(values["cs2_launch_options"])
+        account = self.store.get(account_id)
+        self.settings_scope_note.configure(text=f"Editing {account_label(account)}. Changes override this account’s defaults."
+                                            if account else "Editing defaults. Accounts without custom settings inherit these options.")
+        self._refresh_login_action()
+        self._refit()
+
+    def _save_setting(self, name, value, default_save):
+        if self._settings_account_id is None:
+            default_save(value)
+        else:
+            account = self.store.get(self._settings_account_id)
+            overrides = dict(account.get("preferences", {}))
+            overrides[name] = value
+            self.store.set_account_preferences(account["id"], overrides)
+
+    def _reset_profile(self):
+        if self._settings_account_id and self._login_thread is None and self._extraction is None:
+            try:
+                self.store.reset_account_preferences(self._settings_account_id)
+            except OSError:
+                self._set_status("Could not reset this account’s settings. Saved settings are unchanged.", ERR)
+            else:
+                self._change_settings_scope(self._settings_account_id, save=False)
+
+    def _recover_data(self):
+        if self._login_thread is not None or self._extraction is not None:
+            return
+        source = filedialog.askopenfilename(title="Choose a JWTractor saved-data backup",
+                                            initialdir=os.path.dirname(os.path.abspath(self.store.path)),
+                                            initialfile=os.path.basename(self.store.path) + ".bak",
+                                            filetypes=[("JWTractor backups", "*.bak *.json"), ("All files", "*.*")], parent=self.root)
+        if not source:
+            return
+        if not messagebox.askyesno("Recover saved data", "Restore this backup? The current file will be preserved separately before replacement.", parent=self.root):
+            return
+        self._stop_cooldown_check()
+        self._stop_presence_check()
+        try:
+            self.store.recover(source)
+        except OSError as exc:
+            self.diagnostics.record("store.recovery_failed", exc)
+            self.data_status.configure(text=str(exc), fg=ERR)
+        else:
+            self.diagnostics.record("store.recovered")
+            self.current_account = None
+            self._set_output("")
+            self._set_details([])
+            self._account_query = ""
+            self._change_settings_scope(None, save=False)
+            self._restore_selection()
+            self._refresh_saved()
+            self._refresh_login_action()
+            self.data_status.configure(text="Backup restored. The previous file was preserved in the saved-data folder.", fg=OK)
+            self._set_status("Saved data recovered.", OK)
+        self.data_card.fit()
+        self._refit()
+
+    def _copy_diagnostics(self):
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(self.diagnostics.report())
+        except tk.TclError:
+            self._set_status("Could not copy diagnostics. Try again when the clipboard is available.", ERR)
+        else:
+            self._set_status("Diagnostics copied. Tokens and account details are excluded.", OK)
+
+    def _ui_exception(self, kind, value, traceback):
+        self.diagnostics.record("ui.failed", value)
+        if not self._closing:
+            self._set_status("An interface error occurred. Copy diagnostics in Settings, then retry.", ERR)
 
     def _select_tab(self, name):
         if name == self.active_tab:
             return "break"
         if not self._save_cs2_launch_options():
+            self._reveal_cs2_error()
             return "break"
+        return self._show_tab(name)
+
+    def _show_tab(self, name):
+        """Switch pages after the caller has handled any unsaved settings."""
         self._close_picker()
         self._tab_scroll[self.active_tab] = self.viewport.yview()[0]
         self.active_tab = name
@@ -885,6 +1116,14 @@ class App:
         self.settings_btn.focus_set()
         return "break"
 
+    def _reveal_cs2_error(self):
+        if self.active_tab != "settings":
+            self._show_tab("settings")
+        self.root.update_idletasks()
+        height = max(1, self.settings_content.winfo_reqheight())
+        self.viewport.yview_moveto(self.cs2_options_card.winfo_y() / height)
+        self.cs2_launch_options_entry.focus_set()
+
     def _cycle_tab(self, _=None):
         return self._select_tab("settings" if self.active_tab == "accounts" else "accounts")
 
@@ -893,45 +1132,69 @@ class App:
         self.drop.set_hover(False)
         paths = self.root.tk.splitlist(event.data)
         if paths:
-            self._start_extraction(paths[0], extra_files=len(paths) - 1)
+            self._start_imports(paths)
 
     def _browse(self):
         if self._login_thread is not None or self._extraction is not None:
             return
-        path = filedialog.askopenfilename(
-            title="Choose an executable",
+        paths = filedialog.askopenfilenames(
+            title="Choose executables to import",
             filetypes=[("Executables", "*.exe"), ("All files", "*.*")],
             parent=self.root,
         )
-        if path:
-            self._start_extraction(path)
+        if paths:
+            self._start_imports(paths)
 
     def _start_extraction(self, path, extra_files=0):
+        return self._start_imports([path])
+
+    def _start_imports(self, paths):
         if self._login_thread is not None or self._extraction is not None or self._closing:
             return
         self._select_tab("accounts")
         if self.active_tab != "accounts":
             return
         self._close_picker()
+        paths = list(dict.fromkeys(os.path.abspath(os.fspath(path)) for path in paths))
+        if not paths:
+            return
+        if len(paths) > 2000:
+            self._show_error("Import up to 2,000 files at a time.")
+            return
+        self._import_paths = paths
+        self._import_results = []
+        self.import_card.pack_forget()
+        if len(paths) > 1:
+            self.import_card.pack(after=self.drop, padx=PAD, pady=(GAP, 0))
         cancel, events = threading.Event(), queue.Queue()
         def worker():
-            try:
-                result = extract_from_file(path)
-            except ExtractionError as exc:
-                event = ("error", str(exc))
-            except OSError:
-                event = ("error", "Could not read the executable. Check that it exists and is accessible, then try again.")
-            except Exception:
-                event = ("error", "Could not extract this file. Try another executable or paste the token.")
-            else:
-                event = ("done", result)
+            for index, path in enumerate(paths):
+                if cancel.is_set():
+                    return
+                events.put(("progress", (index, path)))
+                result, error = None, None
+                try:
+                    result = extract_from_file(path)
+                except ExtractionError as exc:
+                    error = str(exc)
+                    self.diagnostics.record("import.failed", exc)
+                except Exception as exc:
+                    error = "Could not read or extract this file. Check access or paste its token instead."
+                    self.diagnostics.record("import.failed", exc)
+                ack = threading.Event()
+                if cancel.is_set():
+                    return
+                events.put(("item", (path, result, error, ack)))
+                while not ack.wait(0.05):
+                    if cancel.is_set():
+                        return
             if not cancel.is_set():
-                events.put(event)
+                events.put(("done", None))
         thread = threading.Thread(target=worker, name="Token extraction", daemon=True)
-        self._extraction = (thread, cancel, events, path, extra_files)
+        self._extraction = (thread, cancel, events, paths, 0)
         self.drop.set_reading(True)
         self._refresh_login_action()
-        self._set_status(f"Reading {os.path.basename(path)}…")
+        self._set_status(f"Importing {len(paths)} file{'s' if len(paths) != 1 else ''}…")
         thread.start()
         self._extraction_poll_job = self.root.after(80, self._poll_extraction)
 
@@ -939,19 +1202,59 @@ class App:
         self._extraction_poll_job = None
         if self._extraction is None:
             return
-        thread, cancel, events, path, extra_files = self._extraction
+        thread, cancel, events, paths, _ = self._extraction
         try:
             kind, value = events.get_nowait()
         except queue.Empty:
             self._extraction_poll_job = self.root.after(80, self._poll_extraction)
             return
-        self._extraction = None
-        self.drop.set_reading(False)
-        self._refresh_login_action()
-        if kind == "error":
-            self._show_error(value)
+        if kind == "progress":
+            index, path = value
+            self._set_status(f"Importing {index + 1} of {len(paths)}: {os.path.basename(path)}…")
+        elif kind == "item":
+            path, result, error, ack = value
+            outcome = "Failed"
+            if error is None:
+                try:
+                    self._accept_result(result, copy=False)
+                    outcome = self.store.last_add_action.capitalize()
+                except (OSError, ExtractionError) as exc:
+                    error = str(exc) if isinstance(exc, ExtractionError) else "Could not save. Check access to saved data."
+                    self.diagnostics.record("import.save_failed", exc)
+            self._import_results.append((os.path.basename(path), error or outcome, error is None))
+            self._render_import_report()
+            ack.set()
         else:
-            self._present_extracted(value, path, extra_files)
+            self._extraction = None
+            self.drop.set_reading(False)
+            if self._settings_account_id is not None and self.current_account:
+                self._change_settings_scope(self.current_account["id"], save=False)
+            self._refresh_login_action()
+            successes = sum(item[2] for item in self._import_results)
+            if len(paths) == 1 and successes:
+                copied = self._copy(announce=False)
+                self._set_status(f"Imported {os.path.basename(paths[0])} — " +
+                                 ("copied · saved" if copied else "saved · clipboard unavailable; use Copy to retry"),
+                                 OK if copied else FG_MUTED)
+            elif len(paths) == 1:
+                self._show_error(self._import_results[0][1])
+            else:
+                if successes:
+                    self._copy(announce=False)
+                self._set_status(f"Import complete: {successes} saved, {len(paths) - successes} failed. See the per-file results.",
+                                 OK if successes == len(paths) else FG_MUTED)
+            self._ensure_presence()
+            return
+        self._extraction_poll_job = self.root.after(30, self._poll_extraction)
+
+    def _render_import_report(self):
+        self.import_report.configure(state="normal")
+        self.import_report.delete("1.0", "end")
+        self.import_report.insert("1.0", "\n".join(f"{name} — {outcome}" for name, outcome, _ in self._import_results))
+        self.import_report.configure(state="disabled", height=min(6, max(1, len(self._import_results))))
+        self.import_report.see("end")
+        self.import_card.fit()
+        self._refit()
 
     def _cancel_extraction(self):
         if self._extraction_poll_job is not None:
@@ -961,8 +1264,16 @@ class App:
             self._extraction[1].set()
             self._extraction = None
             self.drop.set_reading(False)
+            if self._settings_account_id is not None and self.current_account:
+                self._change_settings_scope(self.current_account["id"], save=False)
             self._refresh_login_action()
-            self._set_status("Import cancelled. No account was added.")
+            completed = len(self._import_results)
+            self._import_results.extend((os.path.basename(path), "Skipped (cancelled)", False)
+                                        for path in self._import_paths[completed:])
+            self._render_import_report()
+            saved = sum(item[2] for item in self._import_results)
+            self._set_status(f"Import cancelled. {saved} completed file{'s' if saved != 1 else ''} saved; remaining files skipped."
+                             if saved else "Import cancelled. No account was added.")
 
     def process(self, path: str, extra_files: int = 0):
         if self._login_thread is not None or self._extraction is not None:
@@ -986,6 +1297,9 @@ class App:
         name = os.path.basename(path)
         try:
             self._accept_result(result)
+        except ExtractionError as exc:
+            self._show_error(str(exc))
+            return
         except OSError:
             self._set_status("Couldn't save the account. Check the saved-accounts folder and try again.", ERR)
             return
@@ -998,17 +1312,38 @@ class App:
         copied = "copied · saved" if self._last_copy_succeeded else "saved · clipboard unavailable; use Copy to retry"
         self._set_status(f"Extracted from {name} — {copied}{note}", OK if self._last_copy_succeeded else FG_MUTED)
 
-    def _accept_result(self, result):
+    def _accept_result(self, result, *, copy=True):
         # Save successfully before replacing the current account or result.
         account = self.store.add(result["token"], result["username"])
-        self.current_account = account
-        self._set_output(result["combined"])
-        self._set_details(summarize_claims(result["payload"]))
-        self._refresh_login_action()
-        self._refresh_saved()
-        self._refit()
-        self._last_copy_succeeded = self._copy(announce=False)
+        self._display_account(account)
+        self._last_copy_succeeded = self._copy(announce=False) if copy else False
         return account
+
+    def _display_account(self, account):
+        if not self.current_account or self.current_account.get("id") != account.get("id"):
+            self._claims_expanded = False
+        self.current_account = account
+        if self._settings_account_id is not None and self._settings_account_id != account["id"]:
+            self._change_settings_scope(account["id"], save=False)
+        self._set_output(account_combined(account))
+        try:
+            payload = decode_token(account["token"]).get("payload")
+        except ExtractionError:
+            payload = None
+        self._set_details(summarize_claims(payload))
+        self._refresh_saved()
+        self._refresh_login_action()
+        self._refit()
+
+        self._ensure_presence()
+
+    def _restore_selection(self):
+        account = self.store.get(self.store.selected_account_id)
+        if account is None:
+            ordered = self.store.ordered()
+            account = ordered[0] if ordered else None
+        if account is not None:
+            self._display_account(account)
 
     # -- direct token entry --------------------------------------------------
     def _open_token_dialog(self):
@@ -1030,7 +1365,7 @@ class App:
             raise ExtractionError("Wait for the current operation to finish before adding an account.")
         account = self._accept_result(parse_token_input(text, username))
         copied = "copied · saved" if self._last_copy_succeeded else "saved · clipboard unavailable; use Copy to retry"
-        self._set_status(f"Added {account_label(account)} — {copied}", OK if self._last_copy_succeeded else FG_MUTED)
+        self._set_status(f"{self.store.last_add_action.capitalize()} {account_label(account)} — {copied}", OK if self._last_copy_succeeded else FG_MUTED)
         return account
 
     # -- saved accounts ------------------------------------------------------
@@ -1108,7 +1443,7 @@ class App:
                      font=("Segoe UI Semibold", 10)).pack(side="left")
             count = tk.Label(search_heading, bg=SURFACE, fg=FG_FAINT, font=("Segoe UI", 9))
             count.pack(side="right")
-            query = tk.StringVar(master=top)
+            query = tk.StringVar(master=top, value=self._account_query)
             search = tk.Entry(body, textvariable=query, bg=FIELD, fg=FG, insertbackground=FG,
                               selectbackground=ACCENT_LO, relief="flat", bd=0, font=("Segoe UI", 10),
                               highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT)
@@ -1167,6 +1502,7 @@ class App:
                 nonlocal view_h
                 if self._picker is not top:
                     return
+                self._account_query = query.get()
                 for child in inner.winfo_children():
                     child.destroy()
                 terms = query.get().casefold().split()
@@ -1233,6 +1569,11 @@ class App:
             parts.append("Selected")
         if account_status(acc) == "expired":
             parts.append("Token expired")
+        if self._observed_session and self._observed_session[0] == acc.get("subject"):
+            parts.append("Signed in on this PC")
+        presence = self._presence.get(acc.get("subject"))
+        if presence and presence["state"] in ("online", "in-game") and time.time() - presence["checked_at"] <= 90:
+            parts.append("Public: " + presence["message"])
         sub_lbl = tk.Label(
             text, text="  ·  ".join(parts) or "—", bg=SURFACE, fg=FG_MUTED,
             font=("Segoe UI", 9), anchor="w", wraplength=320, justify="left",
@@ -1290,14 +1631,7 @@ class App:
         if self._login_thread is not None or self._extraction is not None:
             return
         self._close_picker()
-        self.current_account = acc
-        self._set_output(account_combined(acc))
-        try:
-            payload = decode_token(acc["token"]).get("payload")
-        except Exception:  # pragma: no cover - stored tokens were valid when saved
-            payload = None
-        self._set_details(summarize_claims(payload))
-        self._refresh_login_action()
+        self._display_account(acc)
         try:
             self.store.touch(acc["id"])
         except OSError:
@@ -1323,6 +1657,7 @@ class App:
             self._refresh_saved()
             if self.current_account and self.current_account.get("id") == acc["id"]:
                 self._refresh_cooldown_details()
+                self._refresh_saved()
         self._rename_dialog = RenameDialog(self.root, acc, save, self._rename_dialog_closed)
 
     def _rename_dialog_closed(self):
@@ -1348,9 +1683,13 @@ class App:
                 return
             if self.current_account and self.current_account.get("id") == acc["id"]:
                 self.current_account = None
+                self._change_settings_scope(None, save=False)
                 self._set_output("")
                 self._set_details([])
                 self._refresh_login_action()
+                self._set_status("Saved account removed. Select another account or add a token.")
+            else:
+                self._set_status(f"Removed {account_label(acc)} from saved accounts.")
             self._refresh_saved()
         self._open_picker()
 
@@ -1370,6 +1709,21 @@ class App:
         self._save_cs2_launch_options()
         return "break"
 
+    def _cs2_draft_changed(self, *_):
+        changed = self.cs2_options_var.get() != self._settings_values()["cs2_launch_options"]
+        self.cs2_revert_btn.set_enabled(changed and self._login_thread is None and self._extraction is None)
+        self.cs2_options_status.configure(text="Unsaved changes. Press Enter or leave the field to save." if changed
+                                           else "Saved. Applies on your next login when enabled.", fg=FG_FAINT)
+        self.cs2_options_field._border = ACCENT if self.root.focus_get() is self.cs2_launch_options_entry else BORDER
+        self.cs2_options_field.fit()
+        self.cs2_options_card.fit()
+
+    def _revert_cs2_options(self):
+        if self._login_thread is None and self._extraction is None:
+            self.cs2_options_var.set(self._settings_values()["cs2_launch_options"])
+            self._save_cs2_launch_options()
+            self.cs2_launch_options_entry.focus_set()
+
     def _focus_cs2_options(self, focused):
         if self.cs2_options_field._border != ERR:
             self.cs2_options_field._border = ACCENT if focused else BORDER
@@ -1380,8 +1734,8 @@ class App:
             return True
         options = self.cs2_launch_options_entry.get()
         try:
-            if options != self.store.preferences["cs2_launch_options"]:
-                self.store.set_cs2_launch_options(options)
+            if options != self._settings_values()["cs2_launch_options"]:
+                self._save_setting("cs2_launch_options", options, self.store.set_cs2_launch_options)
         except (OSError, SteamLoginError) as exc:
             message = str(exc) if isinstance(exc, SteamLoginError) else "Could not save. Check access to the accounts file."
             self.cs2_options_status.configure(text=message, fg=ERR)
@@ -1391,6 +1745,7 @@ class App:
             self.cs2_options_status.configure(text="Saved. Applies on your next login when enabled.", fg=FG_FAINT)
             self.cs2_options_field._border = ACCENT if self.root.focus_get() is self.cs2_launch_options_entry else BORDER
             saved = True
+        self.cs2_revert_btn.set_enabled(not saved)
         self.cs2_options_field.fit()
         self.cs2_options_card.fit()
         self._refit()
@@ -1400,19 +1755,22 @@ class App:
         if self._login_thread is not None or self._extraction is not None:
             return
         try:
-            save(not getattr(self, name))
+            self._save_setting(name, not getattr(self, name), save)
         except OSError:
             self._set_status("Could not save the login option. Please check access to the accounts file.", ERR)
             self._refit()
             return
-        setattr(self, name, self.store.preferences[name])
+        setattr(self, name, self._settings_values()[name])
         button.set_checked(getattr(self, name))
+        self._refresh_login_action()
 
     def _refresh_login_action(self):
         busy = self._login_thread is not None or self._extraction is not None
-        self.login_btn.set_text("Cancel import" if self._extraction is not None else
+        cancelling = self._login_thread is not None and self._login_cancel.is_set()
+        self.login_btn.set_text("Cancelling…" if cancelling else "Cancel import" if self._extraction is not None else
                                 "Cancel login" if busy else "Log in to Steam")
-        self.login_btn.set_enabled(busy or (os.name == "nt" and self.current_account is not None))
+        self.login_btn.set_enabled(not cancelling and not self._closing and
+                                   (busy or (os.name == "nt" and self.current_account is not None)))
         self.saved_btn.set_enabled(not busy)
         self.paste_btn.set_enabled(not busy)
         self.copy_btn.set_enabled(bool(self.result_text) and not busy)
@@ -1421,17 +1779,38 @@ class App:
         self.disable_cloud_sync_btn.set_enabled(not busy and os.name == "nt")
         self.use_cs2_launch_options_btn.set_enabled(not busy and os.name == "nt")
         self.cs2_launch_options_entry.configure(state="disabled" if busy else "normal")
+        self.cs2_revert_btn.set_enabled(not busy and self.cs2_options_var.get() != self._settings_values()["cs2_launch_options"])
+        self.defaults_scope_btn.set_enabled(not busy)
+        self.account_scope_btn.set_enabled(not busy and self.current_account is not None)
+        profile = self.store.get(self._settings_account_id)
+        self.reset_profile_btn.set_enabled(not busy and bool(profile and profile.get("preferences")))
+        self.recover_btn.set_enabled(not busy)
+        if hasattr(self, "presence_btn") and self.presence_btn.winfo_exists():
+            self.presence_btn.set_enabled(not busy)
         if self.cooldown_btn is not None and self.cooldown_btn.winfo_exists():
             self.cooldown_btn.set_enabled(not busy)
         if self.active_tab == "accounts":
-            self.paste_btn.pack(side="right")
+            self.paste_btn.pack(side="right", before=self.header_titles)
         else:
             self.paste_btn.pack_forget()
         # Keep cancellation accessible when viewing Settings during a login.
-        if self.active_tab == "accounts" or busy:
+        if (self.active_tab == "accounts" and self.current_account is not None) or busy:
             self.actions.pack(fill="x", **({"before": self.status} if self.status.winfo_manager() else {}))
         else:
             self.actions.pack_forget()
+        if self.active_tab == "accounts" and self.current_account is not None:
+            effective = self.store.effective_preferences(self.current_account["id"])
+            options = []
+            if effective["disable_cloud_sync"]:
+                options.append("Cloud off")
+            if effective["private_login"]:
+                options.extend(("Friends offline", "Remote Play off"))
+            if effective["use_cs2_launch_options"]:
+                options.append("Custom CS2 options" if effective["cs2_launch_options"] else "Clear CS2 options")
+            self.login_summary.configure(text="Next login: " + (" · ".join(options) if options else "Steam’s current settings"))
+            self.login_summary.pack(before=self.actions, fill="x", pady=(0, GAP))
+        else:
+            self.login_summary.pack_forget()
         self._fit_footer_spacing()
 
     def _fit_footer_spacing(self):
@@ -1452,7 +1831,7 @@ class App:
             return
         if self._login_thread is not None:
             self._login_cancel.set()
-            self.login_btn.set_enabled(False)
+            self._refresh_login_action()
             self._set_status("Cancelling Steam login…")
             return
         if self.current_account is None:
@@ -1467,19 +1846,20 @@ class App:
             self._refit()
             return
         if not self._save_cs2_launch_options():
-            self._select_tab("settings")
+            self._reveal_cs2_error()
             return
         self._stop_cooldown_check()
         self._refresh_cooldown_details()
         self._close_picker()
         self._login_cancel.clear()
-        cs2_options = self.store.preferences["cs2_launch_options"] if self.use_cs2_launch_options else None
+        effective = self.store.effective_preferences(account["id"])
+        cs2_options = effective["cs2_launch_options"] if effective["use_cs2_launch_options"] else None
         self._login_thread = threading.Thread(target=self._login_worker,
-                                              args=(account, self.private_login, self.disable_cloud_sync, cs2_options), name="Steam login")
+                                              args=(account, effective["private_login"], effective["disable_cloud_sync"], cs2_options), name="Steam login")
         self._refresh_login_action()
         self._set_status("Preparing Steam login…")
         self._login_thread.start()
-        self.root.after(80, self._drain_login_events)
+        self._login_poll_job = self.root.after(80, self._drain_login_events)
 
     def _login_worker(self, account, private_login=False, disable_cloud_sync=False, cs2_launch_options=None):
         try:
@@ -1489,13 +1869,17 @@ class App:
                                    cs2_launch_options=cs2_launch_options)
             self._login_events.put(("done", result))
         except LoginCancelled as exc:
+            self.diagnostics.record("login.cancelled", exc)
             self._login_events.put(("cancelled", str(exc)))
         except SteamLoginError as exc:
+            self.diagnostics.record("login.failed", exc)
             self._login_events.put(("error", str(exc)))
-        except Exception:
+        except Exception as exc:
+            self.diagnostics.record("login.failed", exc)
             self._login_events.put(("error", "Unexpected Steam login failure. Check Steam and its configuration backups before retrying."))
 
     def _drain_login_events(self):
+        self._login_poll_job = None
         while True:
             try:
                 kind, value = self._login_events.get_nowait()
@@ -1535,7 +1919,7 @@ class App:
                 self._set_status(value, FG_MUTED if kind == "cancelled" else ERR)
             self._refit()
         if self._login_thread is not None:
-            self.root.after(80, self._drain_login_events)
+            self._login_poll_job = self.root.after(80, self._drain_login_events)
 
     def _request_close(self, *_):
         self._cancel_extraction()
@@ -1543,15 +1927,18 @@ class App:
         if self._login_thread is not None:
             self._closing = True
             self._login_cancel.set()
-            self.login_btn.set_enabled(False)
+            self._refresh_login_action()
             self._set_status("Cancelling Steam login before closing…")
             return
         if self._save_cs2_launch_options():
             self.root.destroy()
+        else:
+            self._reveal_cs2_error()
 
     # -- output helpers ------------------------------------------------------
     def _set_output(self, text: str):
         self.result_text = text
+        self.drop.set_compact(bool(text))
         self.copy_btn.set_text("Copy")
         self.copy_btn.set_enabled(bool(text))
         self.output.configure(state="normal")
@@ -1565,6 +1952,12 @@ class App:
         self.output.configure(state="disabled", takefocus=bool(text))
         self.output.yview_moveto(0)
         self._reflow_output()
+        if text:
+            self.token_heading.pack(fill="x", padx=PAD, pady=GAP)
+            self.result_card.pack(padx=PAD)
+        else:
+            self.token_heading.pack_forget()
+            self.result_card.pack_forget()
 
     def _reflow_output(self):
         """Grow the result Text to fit its wrapped content, then fit its card.
@@ -1576,7 +1969,7 @@ class App:
         """
         text = self.output.get("1.0", "end-1c")
         char_w = max(1, self._mono.measure("0"))
-        avail = CONTENT_W - 2 * self.result_card.inset - 2 * self._text_padx - 2
+        avail = self._content_width - 2 * self.result_card.inset - 2 * self._text_padx - 2
         per_line = max(1, int(avail // char_w))
         lines = (len(text) + per_line - 1) // per_line  # ceil division
         self.output.configure(height=max(1, min(lines, 12)))
@@ -1589,27 +1982,60 @@ class App:
             child.destroy()
         self.details_inner.columnconfigure(0, weight=0)
         self.details_inner.columnconfigure(1, weight=1)
-        offset = 0
         if self.current_account:
             account = self.current_account
             heading = tk.Frame(self.details_inner, bg=SURFACE)
-            heading.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, GAP))
+            heading.grid(row=0, column=0, columnspan=2, sticky="ew")
             tk.Label(heading, text=account_label(account), bg=SURFACE, fg=FG,
                      font=("Segoe UI Semibold", 12), anchor="w", justify="left",
-                     wraplength=CONTENT_W - 2 * GAP).pack(fill="x")
+                     wraplength=self._content_width - 2 * GAP).pack(fill="x")
             tk.Label(heading, text=f"Steam login: {account['username']}", bg=SURFACE, fg=FG_MUTED,
                      font=("Segoe UI", 9), anchor="w", justify="left",
-                     wraplength=CONTENT_W - 2 * GAP).pack(fill="x", pady=(4, GAP))
-            tk.Frame(heading, bg=BORDER, height=1).pack(fill="x")
-            offset = 1
-        if not rows:
+                     wraplength=self._content_width - 2 * GAP).pack(fill="x", pady=(GAP, 0))
+            try:
+                validate_account_name(account.get("username"))
+                validate_token(account.get("token"))
+            except SteamLoginError as exc:
+                readiness, color = str(exc), ERR
+            else:
+                readiness, color = "Ready to log in. Steam will confirm the session.", FG_MUTED
+            if os.name != "nt":
+                readiness, color = "Steam login is available on Windows. You can still inspect and copy tokens.", FG_MUTED
+            self.login_readiness = tk.Label(heading, text=readiness, bg=SURFACE, fg=color,
+                                            font=("Segoe UI", 9), anchor="w", justify="left",
+                                            wraplength=self._content_width - 2 * GAP)
+            self.login_readiness.pack(fill="x", pady=(GAP, 0))
+            self.local_session_label = tk.Label(heading, bg=SURFACE, font=("Segoe UI", 9),
+                                                anchor="w", justify="left", wraplength=self._content_width - 2 * GAP)
+            self.local_session_label.pack(fill="x", pady=(GAP, 0))
+            self.public_presence_label = tk.Label(heading, bg=SURFACE, font=("Segoe UI", 9),
+                                                  anchor="w", justify="left", wraplength=self._content_width - 2 * GAP)
+            self.public_presence_label.pack(fill="x", pady=(GAP, 0))
+            self._update_session_labels()
+            self._update_presence_label()
+            self._build_cooldown_details(1)
+            detail_actions = tk.Frame(self.details_inner, bg=SURFACE)
+            detail_actions.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(GAP, 0))
+            self.claims_btn = RoundedButton(detail_actions,
+                                           "Hide token details" if self._claims_expanded else "Show token details",
+                                           self._toggle_claims, style="secondary", height=32, pad_x=GAP)
+            self.claims_btn.pack(side="left")
+            self.presence_btn = RoundedButton(detail_actions, "Refresh online status", lambda: self._ensure_presence(force=True),
+                                              style="secondary", height=32, pad_x=GAP)
+            self.presence_btn.pack(side="right")
+            self.presence_btn.set_enabled(self._login_thread is None and self._extraction is None)
+        else:
             tk.Label(
                 self.details_inner,
-                text="Token claims (issuer, expiry, …) will appear here.",
-                bg=SURFACE, fg=FG_FAINT, font=("Segoe UI", 10), anchor="w",
-            ).grid(row=offset, column=0, columnspan=2, sticky="ew")
-        else:
+                text="Choose a saved account, import an executable, or paste a token to get started.",
+                bg=SURFACE, fg=FG_MUTED, font=("Segoe UI", 10), anchor="w", justify="left",
+                wraplength=self._content_width - 2 * GAP,
+            ).grid(row=0, column=0, columnspan=2, sticky="ew")
+        if self._claims_expanded:
             _WARN_LABELS = {"Status", "Revoked if", "Note"}
+            label_font = tkfont.Font(root=self.root, family="Segoe UI", size=10)
+            label_width = max((label_font.measure(label) for label, _ in rows), default=0)
+            value_width = max(120, self._content_width - 3 * GAP - label_width)
             for i, (label, value) in enumerate(rows):
                 is_warn = label in _WARN_LABELS
                 val_fg = FG
@@ -1622,16 +2048,18 @@ class App:
                 tk.Label(
                     self.details_inner, text=label, bg=SURFACE, fg=FG_MUTED,
                     font=("Segoe UI", 10),
-                ).grid(row=i + offset, column=0, sticky="nw", padx=(0, GAP),
-                       pady=(0, GAP) if i < len(rows) - 1 else 0)
+                ).grid(row=i + 3, column=0, sticky="nw", padx=(0, GAP), pady=(GAP, 0))
                 tk.Label(
                     self.details_inner, text=value, bg=SURFACE, fg=val_fg,
                     font=("Segoe UI Semibold", 10),
-                    wraplength=350, justify="left", anchor="w",
-                ).grid(row=i + offset, column=1, sticky="ew",
-                       pady=(0, GAP) if i < len(rows) - 1 else 0)
-        self._build_cooldown_details((len(rows) if rows else 1) + offset)
+                    wraplength=value_width, justify="left", anchor="w",
+                ).grid(row=i + 3, column=1, sticky="ew", pady=(GAP, 0))
         self.details_card.fit()
+
+    def _toggle_claims(self):
+        self._claims_expanded = not self._claims_expanded
+        self._refresh_cooldown_details()
+        self.claims_btn.focus_set()
 
     def _current_steam_id(self):
         if self.current_account is None:
@@ -1658,7 +2086,7 @@ class App:
         self.cooldown_btn = button = RoundedButton(heading, "Cancel check" if checking else "Refresh data",
                                self._check_cooldown, style="secondary", height=32, min_width=140, pad_x=GAP)
         button.pack(side="right")
-        button.set_enabled(self._login_thread is None)
+        button.set_enabled(self._login_thread is None and self._extraction is None and not self._closing)
         cached = self.store.cooldowns.get(steam_id)
         message, color = "Not checked yet", FG_MUTED
         if cached:
@@ -1667,18 +2095,18 @@ class App:
             if cached.get("expires_at") and cached["expires_at"] <= time.time():
                 message, color = "Recorded cooldown has elapsed — refresh to confirm.", FG_MUTED
         tk.Label(panel, text=message, bg=SURFACE, fg=color, font=("Segoe UI", 10),
-                 anchor="w", justify="left", wraplength=CONTENT_W - 2 * GAP).pack(fill="x", pady=(GAP, 0))
+                 anchor="w", justify="left", wraplength=self._content_width - 2 * GAP).pack(fill="x", pady=(GAP, 0))
         if cached:
             checked = datetime.fromtimestamp(cached["checked_at"], timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
             note = f"Last refreshed: {checked}. Updates when this account logs into Steam."
         else:
             note = "Checks automatically when this account is logged into Steam."
         tk.Label(panel, text=note, bg=SURFACE, fg=FG_FAINT, font=("Segoe UI", 9),
-                 anchor="w", justify="left", wraplength=CONTENT_W - 2 * GAP).pack(fill="x", pady=(GAP, 0))
+                 anchor="w", justify="left", wraplength=self._content_width - 2 * GAP).pack(fill="x", pady=(GAP, 0))
         notice = self._cooldown_notice.get(steam_id)
         if notice:
             tk.Label(panel, text=notice, bg=SURFACE, fg=FG_MUTED, font=("Segoe UI", 9),
-                     anchor="w", justify="left", wraplength=CONTENT_W - 2 * GAP).pack(fill="x", pady=(GAP, 0))
+                     anchor="w", justify="left", wraplength=self._content_width - 2 * GAP).pack(fill="x", pady=(GAP, 0))
 
     def _refresh_cooldown_details(self):
         self._set_details(self._detail_rows)
@@ -1703,7 +2131,8 @@ class App:
         def worker():
             try:
                 result = check_client_cooldown(steam_id, cancel=cancel)
-            except Exception:
+            except Exception as exc:
+                self.diagnostics.record("cooldown.failed", exc)
                 result = {"state": "unknown", "message": "Could not read the cooldown from Steam. Retry after Steam finishes loading."}
             if not cancel.is_set():
                 events.put(result)
@@ -1728,11 +2157,13 @@ class App:
         if result.get("state") in ("active", "clear"):
             try:
                 self.store.set_cooldown(steam_id, result)
-            except (OSError, ValueError):
+            except (OSError, ValueError) as exc:
+                self.diagnostics.record("cooldown.failed", exc)
                 self._cooldown_notice[steam_id] = "Check completed, but could not save it. Check access to the accounts file."
             else:
                 self._cooldown_notice.pop(steam_id, None)
         else:
+            self.diagnostics.record("cooldown.failed")
             self._cooldown_notice[steam_id] = result.get("message", "Could not read Steam’s page.")
         self._refresh_cooldown_details()
 
@@ -1748,10 +2179,19 @@ class App:
         self._cooldown_notice[steam_id] = "Check cancelled. Saved data is unchanged."
 
     def _watch_steam_session(self):
+        if self._steam_watch_job is not None:
+            self.root.after_cancel(self._steam_watch_job)
         self._steam_watch_job = None
         if self._closing:
             return
         session = current_steam_session()
+        changed = session != self._observed_session
+        self._observed_session = session
+        self._update_session_labels()
+        if changed:
+            self.details_card.fit()
+            self._refit()
+        self._ensure_presence()
         if session != self._steam_session_seen and self._login_thread is None and self._cooldown_check is None:
             if session is None:
                 self._steam_session_seen = None
@@ -1770,8 +2210,105 @@ class App:
                     self._check_cooldown(steam_id, automatic=True)
         self._steam_watch_job = self.root.after(3000, self._watch_steam_session)
 
+    def _update_session_labels(self):
+        session = self._observed_session
+        if session:
+            active = next((a for a in self.store.accounts if a.get("subject") == session[0]), None)
+            self.steam_status.configure(text="Steam: " + (account_label(active) if active else session[0]), fg=OK)
+        else:
+            self.steam_status.configure(text="Steam: no active sign-in detected", fg=FG_MUTED)
+        label = getattr(self, "local_session_label", None)
+        if label is not None and label.winfo_exists():
+            selected_id = self._current_steam_id()
+            matching = bool(session and session[0] == selected_id)
+            label.configure(text="This PC: Signed into this account" if matching else
+                            "This PC: Steam is signed into another account" if session else "This PC: No active Steam sign-in detected",
+                            fg=OK if matching else FG_MUTED)
+
+    def _update_presence_label(self):
+        label = getattr(self, "public_presence_label", None)
+        if label is None or not label.winfo_exists():
+            return
+        steam_id = self._current_steam_id()
+        result = self._presence.get(steam_id)
+        checking = self._presence_worker and self._presence_worker[0] == steam_id
+        if result:
+            age = max(0, int(time.time()) - result.get("checked_at", 0))
+            message = result["message"] + f" · checked {age}s ago"
+            color = OK if result["state"] in ("online", "in-game") and age <= 90 else FG_MUTED
+            if age > 90:
+                message = "Last known: " + message + " (stale)"
+        else:
+            message, color = "Checking…" if checking else "Not checked", FG_MUTED
+        if checking and result:
+            message += " · refreshing…"
+        label.configure(text="Public Friends status: " + message, fg=color)
+
+    def _ensure_presence(self, *, force=False):
+        steam_id = self._current_steam_id()
+        if steam_id is None or self._closing or self._extraction is not None or self._login_thread is not None:
+            return
+        cached = self._presence.get(steam_id)
+        if not force and cached and time.time() - cached.get("checked_at", 0) < 60:
+            self._update_presence_label()
+            return
+        if self._presence_worker is not None:
+            if self._presence_worker[0] == steam_id:
+                return
+            self._stop_presence_check()
+        cancel, events = threading.Event(), queue.Queue()
+        def worker():
+            try:
+                result = fetch_presence(steam_id)
+            except Exception as exc:
+                self.diagnostics.record("presence.failed", exc)
+                result = {"state": "unknown", "message": "Public presence unavailable."}
+            if not cancel.is_set():
+                events.put(dict(result, checked_at=int(time.time())))
+        thread = threading.Thread(target=worker, name="Public Steam presence", daemon=True)
+        self._presence_worker = (steam_id, cancel, events, thread)
+        self._update_presence_label()
+        thread.start()
+        self._presence_poll_job = self.root.after(100, self._poll_presence)
+
+    def _poll_presence(self):
+        if self._presence_poll_job is not None:
+            self.root.after_cancel(self._presence_poll_job)
+        self._presence_poll_job = None
+        if self._presence_worker is None:
+            return
+        steam_id, cancel, events, thread = self._presence_worker
+        try:
+            result = events.get_nowait()
+        except queue.Empty:
+            self._presence_poll_job = self.root.after(100, self._poll_presence)
+            return
+        self._presence_worker = None
+        self._presence[steam_id] = result
+        if result.get("state") == "unknown":
+            self.diagnostics.record("presence.failed")
+        self._update_presence_label()
+        self.details_card.fit()
+        self._refit()
+
+    def _stop_presence_check(self):
+        if self._presence_poll_job is not None:
+            self.root.after_cancel(self._presence_poll_job)
+            self._presence_poll_job = None
+        if self._presence_worker is not None:
+            self._presence_worker[1].set()
+            self._presence_worker = None
+
     def _stop_steam_watch(self, event):
         if event.widget is self.root:
+            if self._resize_job is not None:
+                self.root.after_cancel(self._resize_job)
+                self._resize_job = None
+            self._stop_presence_check()
+            self.diagnostics.close()
+            if self._login_poll_job is not None:
+                self.root.after_cancel(self._login_poll_job)
+                self._login_poll_job = None
             if self._extraction_poll_job is not None:
                 self.root.after_cancel(self._extraction_poll_job)
                 self._extraction_poll_job = None
@@ -1787,11 +2324,8 @@ class App:
                 self._copy_reset_job = None
 
     def _show_error(self, message: str):
-        self.current_account = None
-        self._refresh_login_action()
-        self._set_output("")
-        self._set_details([])
-        self._refit()
+        if self.current_account is not None:
+            message += " Selected account unchanged."
         self._set_status(message, ERR)
 
     def _set_status(self, text: str, color: str = FG_MUTED):
@@ -1848,10 +2382,11 @@ class App:
     def _escape(self, _=None):
         if self._picker is not None:
             return self._close_picker()
+        if self._extraction is not None or self._login_thread is not None:
+            self._login_to_steam()
+            return "break"
         if self.active_tab == "settings":
             self._select_tab("accounts")
-        else:
-            self._request_close()
         return "break"
 
     # -- misc ----------------------------------------------------------------
@@ -1859,7 +2394,7 @@ class App:
         """Size the window to its content's requested size, then centre it."""
         self._refit()
         self.root.update_idletasks()
-        w = self.root.winfo_reqwidth()
+        w = WIN_W
         h = self.root.winfo_height()
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
@@ -1869,14 +2404,68 @@ class App:
 
     def _refit(self):
         """Resize the window to its content's height, keeping its position."""
+        if self._layout_running:
+            return
         self.root.update_idletasks()
         page = self._pages[self.active_tab]
         content_height = page.winfo_reqheight() + (PAD if not self.footer.winfo_manager() else 0)
-        self.viewport.configure(height=content_height, scrollregion=(0, 0, WIN_W, content_height))
+        width = self._content_width + 2 * PAD
+        self.viewport.configure(height=content_height, scrollregion=(0, 0, width, content_height))
         self.root.update_idletasks()
+        if self._manual_size is not None:
+            return
         h = min(self.root.winfo_reqheight(), self.root.winfo_screenheight() - 120)
         y = max(0, min(self.root.winfo_y(), self.root.winfo_screenheight() - h - 80))
+        self._auto_geometry = (WIN_W, h)
         self.root.geometry(f"{WIN_W}x{h}+{max(0, self.root.winfo_x())}+{y}")
+
+    def _on_root_resize(self, event):
+        if event.widget is not self.root or self._layout_running:
+            return
+        size = (event.width, event.height)
+        if size == self._auto_geometry or event.width < 520:
+            return
+        self._manual_size = size
+        if self._resize_job is not None:
+            self.root.after_cancel(self._resize_job)
+        self._resize_job = self.root.after(60, self._apply_resize)
+
+    def _apply_resize(self):
+        self._resize_job = None
+        width = self.root.winfo_width()
+        new_width = max(472, width - 2 * PAD)
+        if self._content_width == new_width:
+            self._refit()
+            return
+        old_width = self._content_width
+        self._layout_running = True
+        try:
+            self._content_width = new_width
+            self.viewport.itemconfigure(self._content_window, width=width)
+            def rewrap(widget):
+                if isinstance(widget, tk.Label) and int(widget.cget("wraplength")):
+                    if not hasattr(widget, "_layout_margin"):
+                        widget._layout_margin = old_width - int(widget.cget("wraplength"))
+                    widget.configure(wraplength=max(120, new_width - widget._layout_margin))
+                for child in widget.winfo_children():
+                    rewrap(child)
+            for page in (self.content, self.settings_content, self.footer):
+                rewrap(page)
+            self.subtitle.configure(wraplength=max(150, new_width - 46 - 2 * GAP - self.paste_btn.winfo_reqwidth()))
+            self.steam_status.configure(wraplength=max(120, new_width - 124))
+            self.drop.set_width(new_width)
+            for card in (self.import_card, self.result_card, self.details_card, self.login_options_card,
+                         self.cs2_options_card, self.data_card):
+                card.set_width(new_width)
+            self.cs2_options_field.set_width(new_width - 2 * GAP)
+            self.cs2_options_card.fit()
+            self.saved_btn.set_width(new_width)
+            for button in (self.copy_btn, self.login_btn, self.defaults_scope_btn, self.account_scope_btn):
+                button.set_width((new_width - GAP) // 2)
+            self._reflow_output()
+        finally:
+            self._layout_running = False
+        self._refit()
 
     def _update_scrollbar(self, first, last):
         first, last = float(first), float(last)
@@ -1894,7 +2483,7 @@ class App:
         self.viewport.yview_moveto(event.y / max(1, self.scrollbar.winfo_height()) - (last - first) / 2)
 
     def _scroll_content(self, event):
-        if event.widget is self.output and self.output.yview() != (0.0, 1.0):
+        if isinstance(event.widget, tk.Text) and event.widget.yview() != (0.0, 1.0):
             return  # Text's own scrolling already handled this event.
         if self.viewport.yview() != (0.0, 1.0):
             direction = -1 if event.delta > 0 else 1
@@ -1907,10 +2496,9 @@ def main():
     app = App(root)
 
     # If launched by dropping a file onto the .exe icon, process it immediately.
-    for arg in sys.argv[1:]:
-        if os.path.isfile(arg):
-            root.after(150, lambda p=arg: app._start_extraction(p))
-            break
+    paths = [arg for arg in sys.argv[1:] if os.path.isfile(arg)]
+    if paths:
+        root.after(150, lambda: app._start_imports(paths))
 
     root.mainloop()
 

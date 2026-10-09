@@ -14,12 +14,14 @@ tested and reused.
 from __future__ import annotations
 
 import hashlib
+import copy
 import json
 import os
 import re
 import time
+import tempfile
 
-from extractor import DEFAULT_SEPARATOR, decode_token
+from extractor import DEFAULT_SEPARATOR, ExtractionError, decode_token
 from steam_login import SteamLoginError, validate_cs2_launch_options
 
 __all__ = [
@@ -88,15 +90,20 @@ class Store:
         self.preferences = {"private_login": False, "disable_cloud_sync": True,
                             "use_cs2_launch_options": False, "cs2_launch_options": ""}
         self.cooldowns = {}
+        self.selected_account_id = None
+        self.load_error = None
+        self.last_add_action = "added"
         self.accounts: list[dict] = self._load()
 
     # -- persistence ---------------------------------------------------------
     def _load(self) -> list[dict]:
         try:
-            with open(self.path, "r", encoding="utf-8") as handle:
-                data = json.load(handle)
-        except (OSError, ValueError):
-            return []  # missing or corrupt file -> start empty, never crash
+            data = self._read_snapshot(self.path)
+        except FileNotFoundError:
+            return []
+        except (OSError, ValueError, SteamLoginError, RecursionError):
+            self.load_error = "Saved data could not be loaded. Recover a backup in Settings; the existing file is unchanged."
+            return []
         cooldowns = data.get("cooldowns") if isinstance(data, dict) else None
         if isinstance(cooldowns, dict):
             self.cooldowns = {steam_id: dict(result) for steam_id, result in cooldowns.items()
@@ -114,16 +121,158 @@ class Store:
         accounts = data.get("accounts") if isinstance(data, dict) else None
         if not isinstance(accounts, list):
             return []
-        return [a for a in accounts if isinstance(a, dict) and a.get("token")]
+        accounts = [dict(a) for a in accounts]
+        for account in accounts:
+            account.setdefault("id", _account_id(account["token"]))
+            account.setdefault("alias", "")
+            account.setdefault("last_used", 0)
+            account.setdefault("separator", DEFAULT_SEPARATOR)
+        selected = data.get("selected_account")
+        if isinstance(selected, str) and any(a.get("id") == selected for a in accounts):
+            self.selected_account_id = selected
+        return accounts
+
+    @staticmethod
+    def _read_snapshot(path):
+        with open(path, "rb") as handle:
+            raw = handle.read(64 * 1024 * 1024 + 1)
+        return Store._decode_snapshot(raw)
+
+    @staticmethod
+    def _decode_snapshot(raw):
+        if len(raw) > 64 * 1024 * 1024:
+            raise ValueError("Saved data is too large.")
+        def unique(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("Duplicate saved-data key.")
+                result[key] = value
+            return result
+        data = json.loads(raw.decode("utf-8"), object_pairs_hook=unique,
+                          parse_constant=lambda _: (_ for _ in ()).throw(ValueError("Invalid number")))
+        if not isinstance(data, dict) or not isinstance(data.get("accounts"), list):
+            raise ValueError("Invalid saved-data structure.")
+        if type(data.get("version", 1)) is not int or data.get("version", 1) != SCHEMA_VERSION:
+            raise ValueError("Unsupported saved-data version.")
+        ids = set()
+        for account in data["accounts"]:
+            if (not isinstance(account, dict) or not isinstance(account.get("token"), str)
+                    or not account["token"] or not isinstance(account.get("username"), str)
+                    or not account["username"] or not isinstance(account.get("alias", ""), str)
+                    or not isinstance(account.get("separator", DEFAULT_SEPARATOR), str)
+                    or type(account.get("last_used", 0)) is not int):
+                raise ValueError("Invalid saved account.")
+            account_id = account.get("id", _account_id(account["token"]))
+            if not isinstance(account_id, str) or not account_id or account_id in ids:
+                raise ValueError("Invalid saved account identity.")
+            ids.add(account_id)
+            overrides = account.get("preferences", {})
+            Store._validate_preferences(overrides)
+        return data
+
+    @staticmethod
+    def _validate_preferences(values):
+        if not isinstance(values, dict) or set(values) - {"private_login", "disable_cloud_sync", "use_cs2_launch_options", "cs2_launch_options"}:
+            raise ValueError("Invalid account settings.")
+        for name, value in values.items():
+            if name == "cs2_launch_options":
+                validate_cs2_launch_options(value)
+            elif type(value) is not bool:
+                raise ValueError("Invalid account setting value.")
+
+    @staticmethod
+    def _atomic_bytes(path, content):
+        folder = os.path.dirname(os.path.abspath(path))
+        os.makedirs(folder, exist_ok=True)
+        descriptor, temporary = tempfile.mkstemp(prefix=".jwtractor-", dir=folder)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
 
     def save(self) -> None:
-        os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
-        tmp = self.path + ".tmp"
+        if self.load_error:
+            raise OSError(self.load_error)
         payload = {"version": SCHEMA_VERSION, "accounts": self.accounts, "preferences": self.preferences,
-                   "cooldowns": self.cooldowns}
-        with open(tmp, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2)
-        os.replace(tmp, self.path)  # atomic swap so a crash can't truncate it
+                   "cooldowns": self.cooldowns, "selected_account": self.selected_account_id}
+        content = json.dumps(payload, indent=2, allow_nan=False).encode("utf-8")
+        if os.path.exists(self.path):
+            try:
+                with open(self.path, "rb") as handle:
+                    previous = handle.read(64 * 1024 * 1024 + 1)
+                self._decode_snapshot(previous)
+            except (OSError, ValueError, SteamLoginError, RecursionError):
+                raise OSError("The saved data changed or became unreadable. Restart JWTractor to recover it; no files were replaced.") from None
+            self._atomic_bytes(self.path + ".bak", previous)
+        else:
+            self._atomic_bytes(self.path + ".bak", content)
+        self._atomic_bytes(self.path, content)
+
+    def recover(self, source=None):
+        """Validate first, preserve the original, then atomically restore a snapshot."""
+        source = os.path.abspath(source or self.path + ".bak")
+        if os.path.normcase(source) == os.path.normcase(os.path.abspath(self.path)):
+            raise OSError("Choose a backup, rather than the current accounts file.")
+        try:
+            with open(source, "rb") as handle:
+                content = handle.read(64 * 1024 * 1024 + 1)
+            self._decode_snapshot(content)
+        except (OSError, ValueError, SteamLoginError, RecursionError):
+            raise OSError("That backup is unreadable or invalid. The current saved data is unchanged.") from None
+        preserved = None
+        if os.path.exists(self.path):
+            with open(self.path, "rb") as handle:
+                original = handle.read()
+            descriptor, preserved = tempfile.mkstemp(prefix="accounts-preserved-", suffix=".json",
+                                                     dir=os.path.dirname(os.path.abspath(self.path)))
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(original)
+                handle.flush()
+                os.fsync(handle.fileno())
+        self._atomic_bytes(self.path, content)
+        self.preferences = {"private_login": False, "disable_cloud_sync": True,
+                            "use_cs2_launch_options": False, "cs2_launch_options": ""}
+        self.cooldowns = {}
+        self.selected_account_id = None
+        self.load_error = None
+        self.accounts = self._load()
+        return preserved
+
+    def effective_preferences(self, account_id=None):
+        account = self.get(account_id)
+        return dict(self.preferences, **(account.get("preferences", {}) if account else {}))
+
+    def set_account_preferences(self, account_id, values):
+        self._validate_preferences(values)
+        account = self.get(account_id)
+        if account is None:
+            raise ValueError("Select a saved account first.")
+        previous = copy.deepcopy(account.get("preferences"))
+        account["preferences"] = dict(values)
+        try:
+            self.save()
+        except OSError:
+            if previous is None:
+                account.pop("preferences", None)
+            else:
+                account["preferences"] = previous
+            raise
+
+    def reset_account_preferences(self, account_id):
+        account = self.get(account_id)
+        if account and "preferences" in account:
+            previous = account.pop("preferences")
+            try:
+                self.save()
+            except OSError:
+                account["preferences"] = previous
+                raise
 
     # -- queries -------------------------------------------------------------
     def get(self, account_id: str) -> dict | None:
@@ -134,9 +283,8 @@ class Store:
 
     def ordered(self) -> list[dict]:
         """All accounts, most-recently-used first."""
-        return sorted(
-            self.accounts, key=lambda a: a.get("last_used", 0), reverse=True
-        )
+        return [account for _, account in sorted(enumerate(self.accounts),
+                key=lambda item: (item[1].get("last_used", 0), item[0]), reverse=True)]
 
     # -- mutations -----------------------------------------------------------
     @staticmethod
@@ -198,19 +346,39 @@ class Store:
         except Exception:
             pass
 
-        existing = self.get(_account_id(token))
+        existing = next((a for a in self.accounts if a["token"] == token), None)
+        matches = []
+        if issuer == "steam" and isinstance(subject, str) and re.fullmatch(r"[0-9]{17}", subject):
+            for account in self.ordered():
+                try:
+                    claims = decode_token(account["token"]).get("payload")
+                except ExtractionError:
+                    continue
+                if isinstance(claims, dict) and claims.get("iss") == "steam" and claims.get("sub") == subject:
+                    matches.append(account)
+            existing = existing or next((a for a in matches if a["id"] == self.selected_account_id), None) or (matches[0] if matches else None)
+        previous_selection = self.selected_account_id
         if existing is not None:
-            previous = dict(existing)
+            if type(exp) is int and any(type(a.get("exp")) is int and exp < a["exp"] for a in matches):
+                raise ExtractionError("This account already has a newer token. Its saved token is unchanged.")
+            previous = copy.deepcopy(existing)
+            previous_accounts = self.accounts
             existing.update(
-                username=username, separator=separator, last_used=now,
+                token=token, username=previous["username"] if previous["token"] != token and matches else username,
+                separator=separator, last_used=now,
                 issuer=issuer, subject=subject, exp=exp,
             )
+            self.accounts = [a for a in self.accounts if a is existing or a not in matches]
+            self.selected_account_id = existing["id"]
             try:
                 self.save()
             except OSError:
                 existing.clear()
                 existing.update(previous)
+                self.accounts = previous_accounts
+                self.selected_account_id = previous_selection
                 raise
+            self.last_add_action = "refreshed" if previous["token"] != token else "existing"
             return existing
 
         account = {
@@ -226,11 +394,14 @@ class Store:
             "exp": exp,
         }
         self.accounts.append(account)
+        self.selected_account_id = account["id"]
         try:
             self.save()
         except OSError:
             self.accounts.remove(account)
+            self.selected_account_id = previous_selection
             raise
+        self.last_add_action = "added"
         return account
 
     def set_alias(self, account_id: str, alias: str) -> None:
@@ -249,19 +420,26 @@ class Store:
         acc = self.get(account_id)
         if acc is not None:
             previous = acc.get("last_used", 0)
+            previous_selection = self.selected_account_id
             acc["last_used"] = int(time.time())
+            self.selected_account_id = acc["id"]
             try:
                 self.save()
             except OSError:
                 acc["last_used"] = previous
+                self.selected_account_id = previous_selection
                 raise
 
     def remove(self, account_id: str) -> None:
         previous = self.accounts
+        previous_selection = self.selected_account_id
         self.accounts = [a for a in previous if a.get("id") != account_id]
         if len(self.accounts) != len(previous):
+            if self.selected_account_id == account_id:
+                self.selected_account_id = None
             try:
                 self.save()
             except OSError:
                 self.accounts = previous
+                self.selected_account_id = previous_selection
                 raise
