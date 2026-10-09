@@ -2510,10 +2510,14 @@ class App:
             self._content_width = new_width
             self.viewport.itemconfigure(self._content_window, width=width)
             def rewrap(widget):
-                if isinstance(widget, tk.Label) and int(widget.cget("wraplength")):
-                    if not hasattr(widget, "_layout_margin"):
-                        widget._layout_margin = old_width - int(widget.cget("wraplength"))
-                    widget.configure(wraplength=max(120, new_width - widget._layout_margin))
+                if isinstance(widget, tk.Label):
+                    # Older Tkinter returns a Tcl distance object here. Use
+                    # Tk's pixel conversion, which also understands unit suffixes.
+                    wraplength = widget.winfo_pixels(str(widget.cget("wraplength")))
+                    if wraplength:
+                        if not hasattr(widget, "_layout_margin"):
+                            widget._layout_margin = old_width - wraplength
+                        widget.configure(wraplength=max(120, new_width - widget._layout_margin))
                 for child in widget.winfo_children():
                     rewrap(child)
             for page in (self.content, self.settings_content, self.footer):

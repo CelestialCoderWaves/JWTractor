@@ -1182,6 +1182,21 @@ def test_new_claims_fit_after_resizing_to_minimum_width(window):
             assert widget.winfo_reqwidth() <= widget.winfo_width()
 
 
+def test_resize_accepts_string_only_tcl_distance_values(window, monkeypatch):
+    label = window.data_status
+    original_cget = label.cget
+    class TclDistance:
+        def __str__(self):
+            return str(original_cget("wraplength"))
+    monkeypatch.setattr(label, "cget", lambda name: TclDistance() if name == "wraplength" else original_cget(name))
+    window.root.deiconify()
+    window.root.geometry("540x650")
+    window.root.update()
+    window._apply_resize()
+    window.root.update_idletasks()
+    assert label.winfo_pixels(str(label.cget("wraplength"))) == window._content_width - 2 * gui.GAP
+
+
 def test_batch_selection_updates_the_account_settings_scope(window, monkeypatch):
     window._add_token("alice----" + jwt())
     window._edit_selected_settings()
