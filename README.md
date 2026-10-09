@@ -40,7 +40,8 @@ size is retained when switching tabs during the session.
 File imports run in the background. Browse for several executables, drop them
 together, or pass their paths to `app.py` to import a queue of up to 2,000 files.
 A per-file report shows added accounts, refreshed tokens, and failures; one
-failed file does not stop the queue. **Cancel import** retains completed saves
+failed file does not stop the queue. Completed results clear when you select
+an account or take another action. **Cancel import** retains completed saves
 and discards pending results. A failed import preserves the selected account,
 its token, and cached data. Account search keeps your query when you rename or
 delete an account.
@@ -253,7 +254,8 @@ contents. Nothing is uploaded automatically.
 ## Add an already extracted token
 
 Click **Paste token** and paste either `username----token` or the JWT alone.
-For a token alone, also enter its actual Steam login name. Input is visible.
+The Steam login name fills automatically from the text before `----`.
+For a token alone, enter its actual Steam login name. Input is visible.
 Click **Add account** (or press Ctrl+Enter) to save and select the account,
 show its decoded claims, and copy the combined string. You can then click
 **Log in to Steam**. Adding a token itself does not close or launch Steam.

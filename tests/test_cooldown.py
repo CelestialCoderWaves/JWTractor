@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from cooldown import matchmaking_url, parse_matchmaking_page
 from store import Store
 
-STEAM_ID = "76561199749125703"
+STEAM_ID = "76561198000000000"
 OTHER = "76561198000000001"
 NOW = datetime(2026, 10, 8, tzinfo=timezone.utc)
 URL = matchmaking_url(STEAM_ID)

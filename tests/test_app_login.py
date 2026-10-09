@@ -368,6 +368,42 @@ def test_raw_token_import_prompts_for_username_and_keeps_invalid_dialog_open(win
     assert window._token_dialog is None
 
 
+def test_combined_token_fills_login_name_and_updates_when_replaced(window):
+    window._open_token_dialog()
+    dialog = window._token_dialog
+    dialog.username.insert(0, "previous_name")
+    dialog.token.insert("1.0", "alice----" + jwt())
+    window.root.update()
+    assert dialog.username.get() == "alice"
+    dialog.token.delete("1.0", "end")
+    dialog.token.insert("1.0", "bob----" + jwt({"sub": "76561198000000001"}))
+    window.root.update()
+    assert dialog.username.get() == "bob"
+    assert not window.store.accounts
+    dialog._submit()
+    assert window.current_account["username"] == "bob"
+
+
+@pytest.mark.parametrize("name", ["alice", "alice-", "alice----alt"])
+def test_autofill_uses_the_same_name_as_combined_token_parsing(window, name):
+    window._open_token_dialog()
+    dialog = window._token_dialog
+    dialog.token.insert("1.0", '"' + name + "----" + jwt() + '"')
+    window.root.update()
+    assert dialog.username.get() == name
+    dialog._submit()
+    assert window.current_account["username"] == name
+
+
+def test_raw_token_keeps_manually_entered_login_name(window):
+    window._open_token_dialog()
+    dialog = window._token_dialog
+    dialog.username.insert(0, "manual_name")
+    dialog.token.insert("1.0", jwt().rsplit(".", 1)[0] + ".signature----suffix")
+    window.root.update()
+    assert dialog.username.get() == "manual_name"
+
+
 def test_reimport_preserves_alias_and_deduplicates(window):
     account = window._add_token("alice----" + jwt())
     window.store.set_alias(account["id"], "Main")
@@ -514,7 +550,7 @@ def detail_text(window):
 
 
 def test_cached_cooldown_display_does_not_start_a_check(window):
-    steam_id = '76561199749125703'
+    steam_id = '76561198000000000'
     window.store.set_cooldown(steam_id, {'state': 'clear', 'message': 'No active matchmaking cooldown'}, checked_at=1700000000)
     window._add_token('alice----' + jwt({'sub': steam_id}))
     assert 'No active matchmaking cooldown' in detail_text(window)
@@ -525,7 +561,7 @@ def test_cached_cooldown_display_does_not_start_a_check(window):
 
 
 def test_cached_expiry_elapsed_is_not_claimed_as_currently_clear(window):
-    steam_id = '76561199749125703'
+    steam_id = '76561198000000000'
     window.store.set_cooldown(steam_id, {'state': 'active', 'message': 'Active cooldown', 'expires_at': 1700000100}, checked_at=1700000000)
     window._add_token('alice----' + jwt({'sub': steam_id}))
     assert 'Recorded cooldown has elapsed' in detail_text(window)
@@ -533,7 +569,7 @@ def test_cached_expiry_elapsed_is_not_claimed_as_currently_clear(window):
 
 
 def test_background_cooldown_result_saved_for_its_account_only(window):
-    steam_id = '76561199749125703'
+    steam_id = '76561198000000000'
     window._add_token('other----' + jwt({'sub': '76561198000000001'}))
     events = gui.queue.Queue()
     events.put({'state': 'clear', 'message': 'No active matchmaking cooldown'})
@@ -546,7 +582,7 @@ def test_background_cooldown_result_saved_for_its_account_only(window):
 
 
 def test_failed_cooldown_refresh_keeps_cached_success(window):
-    steam_id = '76561199749125703'
+    steam_id = '76561198000000000'
     window.store.set_cooldown(steam_id, {'state': 'clear', 'message': 'Previous clear result'}, checked_at=1700000000)
     window._add_token('alice----' + jwt({'sub': steam_id}))
     events = gui.queue.Queue()
@@ -559,7 +595,7 @@ def test_failed_cooldown_refresh_keeps_cached_success(window):
 
 
 def test_steam_account_changes_trigger_one_automatic_check(window, monkeypatch):
-    steam_id = '76561199749125703'
+    steam_id = '76561198000000000'
     other = '76561198000000001'
     window._add_token('alice----' + jwt({'sub': steam_id}))
     window._add_token('bob----' + jwt({'sub': other}))
@@ -585,14 +621,14 @@ def test_steam_account_changes_trigger_one_automatic_check(window, monkeypatch):
 def test_confirmed_login_triggers_selected_account_refresh(window, monkeypatch):
     calls = []
     monkeypatch.setattr(window, '_check_cooldown', lambda sid, **kwargs: calls.append((sid, kwargs)))
-    window._login_events.put(('done', {'sign_in':'confirmed', 'steam_id':'76561199749125703',
+    window._login_events.put(('done', {'sign_in':'confirmed', 'steam_id':'76561198000000000',
                                       'preserved_accounts':1, 'warning':None}))
     window._drain_login_events()
-    assert calls == [('76561199749125703', {'automatic':True})]
+    assert calls == [('76561198000000000', {'automatic':True})]
 
 
 def test_cancelled_client_check_cannot_update_cache(window):
-    steam_id = '76561199749125703'
+    steam_id = '76561198000000000'
     events = gui.queue.Queue()
     cancel = gui.threading.Event()
     window._cooldown_check = (steam_id, None, cancel, events)
@@ -792,6 +828,8 @@ def test_paste_shortcut_prefills_dialog_without_saving_or_logging_in(window, mon
     monkeypatch.setattr(window.root, "clipboard_get", lambda: pasted)
     assert window._paste_shortcut(SimpleNamespace(widget=window.saved_btn)) == "break"
     assert window._token_dialog.token.get("1.0", "end-1c") == pasted
+    window.root.update()
+    assert window._token_dialog.username.get() == "alice"
     assert window.store.accounts == [] and window._login_thread is None
 
 
@@ -969,6 +1007,40 @@ def test_batch_import_reports_each_file_continues_after_failure_and_refreshes(wi
     assert window.current_account["username"] == "alice"
     assert "invalid.exe" in window.import_report.get("1.0", "end-1c")
     assert "3 saved, 1 failed" in window.status.cget("text")
+    assert window.import_card.winfo_manager() == "pack"
+
+
+@pytest.mark.parametrize("action", ["select", "picker", "paste", "settings", "copy", "claims", "presence", "cooldown", "browse", "login"])
+def test_completed_import_report_clears_on_the_next_action(window, tmp_path, monkeypatch, action):
+    files = [tmp_path / "alice.exe", tmp_path / "bob.exe"]
+    files[0].write_bytes(jwt().encode())
+    files[1].write_bytes(jwt({"sub": "76561198000000001"}).encode())
+    window._start_imports(files)
+    finish_import(window)
+    assert window.import_card.winfo_manager() == "pack"
+    before = len(window.store.accounts)
+    monkeypatch.setattr(gui, "check_client_cooldown", lambda *a, **k: {"state": "unknown", "message": "Synthetic unavailable"})
+    monkeypatch.setattr(gui.filedialog, "askopenfilenames", lambda **k: ())
+    monkeypatch.setattr(gui, "validate_token", lambda *_: (_ for _ in ()).throw(gui.SteamLoginError("Synthetic invalid token")))
+    actions = {
+        "select": lambda: window._use_account(window.store.accounts[0]),
+        "picker": window._open_picker,
+        "paste": window._open_token_dialog,
+        "settings": lambda: window._select_tab("settings"),
+        "copy": window._copy,
+        "claims": window._toggle_claims,
+        "presence": lambda: window._ensure_presence(force=True),
+        "cooldown": window._check_cooldown,
+        "browse": window._browse,
+        "login": window._login_to_steam,
+    }
+    actions[action]()
+    window.root.update_idletasks()
+    assert not window.import_card.winfo_manager()
+    assert window.import_report.get("1.0", "end-1c") == ""
+    assert not window._import_results
+    assert "See the per-file results" not in window.status.cget("text")
+    assert len(window.store.accounts) == before
 
 
 def test_batch_cancel_keeps_completed_saves_and_discards_late_result(window, monkeypatch):
@@ -982,6 +1054,10 @@ def test_batch_cancel_keeps_completed_saves_and_discards_late_result(window, mon
     monkeypatch.setattr(gui, "extract_from_file", extract)
     window._start_imports(["first.exe", "second.exe", "third.exe"])
     wait_until_entered(window, entered)
+    window._select_tab("settings")
+    window._select_tab("accounts")
+    assert window.import_card.winfo_manager() == "pack"
+    assert len(window._import_results) == 1
     worker = window._extraction[0]
     window._cancel_extraction()
     release.set()

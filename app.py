@@ -31,6 +31,7 @@ from diagnostics import Diagnostics
 from presence import fetch_presence
 
 from extractor import (
+    DEFAULT_SEPARATOR,
     ExtractionError,
     decode_token,
     extract_from_file,
@@ -340,7 +341,7 @@ class TokenDialog(tk.Toplevel):
                                  selectbackground=ACCENT_LO, font=("Segoe UI", 11), relief="flat", bd=0,
                                  highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT)
         self.username.pack(fill="x", ipady=GAP)
-        tk.Label(body, text="Leave blank if the pasted text includes the username.", bg=BG, fg=FG_MUTED,
+        tk.Label(body, text="Filled automatically from username----token. Enter it for a token alone.", bg=BG, fg=FG_MUTED,
                  font=("Segoe UI", 9), wraplength=470, justify="left", anchor="w").pack(fill="x", pady=(GAP, 0))
         self.error = tk.Label(body, text="", bg=BG, fg=ERR, font=("Segoe UI", 10),
                                wraplength=470, justify="left", anchor="w")
@@ -354,11 +355,39 @@ class TokenDialog(tk.Toplevel):
         self.bind("<Escape>", self.close)
         self.bind("<Control-Return>", self._submit)
         self.username.bind("<Return>", self._submit)
+        self.token.edit_modified(False)
+        self.token.bind("<<Modified>>", self._token_changed)
         self.protocol("WM_DELETE_WINDOW", self.close)
         self._fit(center=True)
         _use_dark_titlebar(self)
         self.grab_set()
         self._focus_job = self.after_idle(self.token.focus_set)
+
+    def _token_changed(self, _=None):
+        if not self.token.edit_modified():
+            return
+        self.token.edit_modified(False)
+        self._fill_username()
+
+    def _fill_username(self):
+        text = self.token.get("1.0", "end-1c").strip()
+        if len(text) > 64 * 1024 or DEFAULT_SEPARATOR not in text:
+            return
+        if len(text) >= 2 and text[0] in "\"'" and text[-1] == text[0]:
+            text = text[1:-1].strip()
+        try:
+            name = parse_token_input(text)["username"]
+        except ExtractionError:
+            # A token alone can contain hyphens in its signature. Keep its
+            # manually entered login name while the token is validated later.
+            if re.fullmatch(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", re.sub(r"\s+", "", text)):
+                return
+            name = text.partition(DEFAULT_SEPARATOR)[0].strip()
+            if not re.fullmatch(r"[A-Za-z0-9_.@-]{1,64}", name):
+                return
+        if self.username.get() != name:
+            self.username.delete(0, "end")
+            self.username.insert(0, name)
 
     def _fit(self, center=False):
         self.update_idletasks()
@@ -374,6 +403,7 @@ class TokenDialog(tk.Toplevel):
         self.geometry(f"{width}x{height}{position}")
 
     def _submit(self, _=None):
+        self._fill_username()
         try:
             self._on_add(self.token.get("1.0", "end-1c"), self.username.get())
         except ExtractionError as exc:
@@ -1013,6 +1043,8 @@ class App:
     def _change_settings_scope(self, account_id, *, save=True):
         if self._login_thread is not None or self._extraction is not None:
             return
+        if save:
+            self._dismiss_import_report()
         if save and not self._save_cs2_launch_options():
             self._reveal_cs2_error()
             return
@@ -1039,6 +1071,7 @@ class App:
 
     def _reset_profile(self):
         if self._settings_account_id and self._login_thread is None and self._extraction is None:
+            self._dismiss_import_report()
             try:
                 self.store.reset_account_preferences(self._settings_account_id)
             except OSError:
@@ -1049,6 +1082,7 @@ class App:
     def _recover_data(self):
         if self._login_thread is not None or self._extraction is not None:
             return
+        self._dismiss_import_report()
         source = filedialog.askopenfilename(title="Choose a JWTractor saved-data backup",
                                             initialdir=os.path.dirname(os.path.abspath(self.store.path)),
                                             initialfile=os.path.basename(self.store.path) + ".bak",
@@ -1080,6 +1114,7 @@ class App:
         self._refit()
 
     def _copy_diagnostics(self):
+        self._dismiss_import_report()
         try:
             self.root.clipboard_clear()
             self.root.clipboard_append(self.diagnostics.report())
@@ -1094,6 +1129,7 @@ class App:
             self._set_status("An interface error occurred. Copy diagnostics in Settings, then retry.", ERR)
 
     def _select_tab(self, name):
+        self._dismiss_import_report()
         if name == self.active_tab:
             return "break"
         if not self._save_cs2_launch_options():
@@ -1137,6 +1173,7 @@ class App:
     def _browse(self):
         if self._login_thread is not None or self._extraction is not None:
             return
+        self._dismiss_import_report()
         paths = filedialog.askopenfilenames(
             title="Choose executables to import",
             filetypes=[("Executables", "*.exe"), ("All files", "*.*")],
@@ -1256,6 +1293,22 @@ class App:
         self.import_card.fit()
         self._refit()
 
+    def _dismiss_import_report(self):
+        # Keep the live report throughout a batch, including automatic account
+        # selection. Completed results last only until the next user action.
+        if self._extraction is not None or not self._import_results:
+            return
+        self.import_card.pack_forget()
+        self._import_results = []
+        self._import_paths = []
+        self.import_report.configure(state="normal")
+        self.import_report.delete("1.0", "end")
+        self.import_report.configure(state="disabled", height=1)
+        if self.status.cget("text").startswith(("Import complete:", "Import cancelled.")):
+            self._set_status("")
+        else:
+            self._refit()
+
     def _cancel_extraction(self):
         if self._extraction_poll_job is not None:
             self.root.after_cancel(self._extraction_poll_job)
@@ -1278,6 +1331,7 @@ class App:
     def process(self, path: str, extra_files: int = 0):
         if self._login_thread is not None or self._extraction is not None:
             return
+        self._dismiss_import_report()
         self._close_picker()
         try:
             result = extract_from_file(path)
@@ -1320,6 +1374,7 @@ class App:
         return account
 
     def _display_account(self, account):
+        self._dismiss_import_report()
         if not self.current_account or self.current_account.get("id") != account.get("id"):
             self._claims_expanded = False
         self.current_account = account
@@ -1349,6 +1404,7 @@ class App:
     def _open_token_dialog(self):
         if self._login_thread is not None or self._extraction is not None:
             return
+        self._dismiss_import_report()
         if self._token_dialog is not None:
             self._token_dialog.lift()
             self._token_dialog.token.focus_set()
@@ -1647,6 +1703,7 @@ class App:
     def _rename_account(self, acc):
         if self._login_thread is not None or self._extraction is not None:
             return
+        self._dismiss_import_report()
         if self._rename_dialog is not None:
             self._rename_dialog.lift()
             self._rename_dialog.alias.focus_set()
@@ -1667,6 +1724,7 @@ class App:
     def _delete_account(self, acc):
         if self._login_thread is not None or self._extraction is not None:
             return
+        self._dismiss_import_report()
         self._close_picker()
         if messagebox.askyesno(
             "Delete account",
@@ -1754,6 +1812,7 @@ class App:
     def _toggle_login_option(self, name, button, save):
         if self._login_thread is not None or self._extraction is not None:
             return
+        self._dismiss_import_report()
         try:
             self._save_setting(name, not getattr(self, name), save)
         except OSError:
@@ -1836,6 +1895,7 @@ class App:
             return
         if self.current_account is None:
             return
+        self._dismiss_import_report()
         account = dict(self.current_account)
         try:
             # Use the original login name, never the friendly display alias.
@@ -2057,6 +2117,7 @@ class App:
         self.details_card.fit()
 
     def _toggle_claims(self):
+        self._dismiss_import_report()
         self._claims_expanded = not self._claims_expanded
         self._refresh_cooldown_details()
         self.claims_btn.focus_set()
@@ -2116,6 +2177,8 @@ class App:
         steam_id = steam_id or self._current_steam_id()
         if steam_id is None or self._login_thread is not None or self._extraction is not None or self._closing:
             return
+        if not automatic:
+            self._dismiss_import_report()
         if self._cooldown_check is not None:
             if automatic:
                 return
@@ -2248,6 +2311,8 @@ class App:
         steam_id = self._current_steam_id()
         if steam_id is None or self._closing or self._extraction is not None or self._login_thread is not None:
             return
+        if force:
+            self._dismiss_import_report()
         cached = self._presence.get(steam_id)
         if not force and cached and time.time() - cached.get("checked_at", 0) < 60:
             self._update_presence_label()
@@ -2340,6 +2405,8 @@ class App:
     def _copy(self, announce: bool = True):
         if not self.result_text or self._login_thread is not None or self._extraction is not None:
             return False
+        if announce:
+            self._dismiss_import_report()
         try:
             self.root.clipboard_clear()
             self.root.clipboard_append(self.result_text)

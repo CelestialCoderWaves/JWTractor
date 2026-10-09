@@ -23,3 +23,20 @@ Thumbs.db
 # Don't commit sample binaries
 *.exe
 *.i64
+
+# Local saved accounts, recovery copies, and diagnostic logs
+accounts.json
+accounts.json.bak
+accounts-preserved-*.json
+diagnostics.log*
+
+# Captured workstation images must never enter tests or release sources
+ShareX/
+screenshots/
+codex-clipboard-*.png
+tests/**/*.png
+tests/**/*.jpg
+tests/**/*.jpeg
+tests/**/*.webp
+tests/**/*.bmp
+tests/**/*.gif
