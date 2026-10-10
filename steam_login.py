@@ -396,6 +396,23 @@ class ConfigFile:
     data: dict
 
 
+@dataclass
+class RawConfigFile:
+    """A game configuration copied without changing its format or encoding."""
+    path: Path
+    original: bytes | None
+    content: bytes
+
+
+def validate_cs2_settings_source(value):
+    if value == "":
+        return value
+    if (not isinstance(value, str) or not re.fullmatch(r"[0-9]{17}", value)
+            or not 76561197960265728 < int(value) < 76561197960265728 + 2 ** 32):
+        raise SteamLoginError("Choose a valid Steam account as the CS2 settings source.")
+    return value
+
+
 def _read_original(path):
     path = Path(path)
     try:
@@ -468,7 +485,7 @@ def config_lock(path):
             lock.unlink(missing_ok=True)
 
 
-def write_configs(configs, cancel=None):
+def write_configs(configs, cancel=None, *, source_checks=()):
     """Call under config_lock; back up exact bytes and roll back failed writes."""
     _check_cancel(cancel)
     paths = [os.path.normcase(os.path.abspath(config.path)) for config in configs]
@@ -476,14 +493,22 @@ def write_configs(configs, cancel=None):
         raise SteamLoginError("Duplicate configuration paths.")
     prepared = []
     for config in configs:
-        text = serialize_vdf(config.data)
-        parse_vdf(text)
-        content = text.encode("utf-8")
+        if isinstance(config, RawConfigFile):
+            content = config.content
+        else:
+            text = serialize_vdf(config.data)
+            parse_vdf(text)
+            content = text.encode("utf-8")
         if len(content) > MAX_CONFIG:
             raise SteamLoginError("Updated configuration exceeds 16 MiB.")
         prepared.append((config, content))
     backups, written = {}, []
+    def check_sources():
+        for path, expected in source_checks:
+            if _read_original(path) != expected:
+                raise SteamLoginError("Source CS2 settings changed during login. Close CS2 and retry.")
     try:
+        check_sources()
         for config, content in prepared:
             _check_cancel(cancel)
             if _read_original(config.path) != config.original:
@@ -494,9 +519,11 @@ def write_configs(configs, cancel=None):
                 _write_exclusive(backup, config.original)
                 backups[config.path] = backup
         for config, content in prepared:
+            check_sources()
             _write_atomic(config.path, content, config.original, cancel)
             written.append((config, content))
         _check_cancel(cancel)
+        check_sources()
         return list(backups.values())
     except Exception as exc:
         failed = []
@@ -680,7 +707,8 @@ def wait_for_sign_in(path, steam_id, checkpoint, cancel=None, timeout=30):
 
 
 def login_account(account_name, token, *, cancel=None, progress=None, private_login=False,
-                  disable_cloud_sync=False, cs2_launch_options=None):
+                  disable_cloud_sync=False, cs2_launch_options=None,
+                  cs2_settings_source=""):
     """Log in the selected account; never use a display alias as the login name."""
     if not IS_WINDOWS:
         raise SteamLoginError("Steam login is available on Windows only.")
@@ -690,31 +718,37 @@ def login_account(account_name, token, *, cancel=None, progress=None, private_lo
     payload = validate_token(token)
     if cs2_launch_options is not None:
         cs2_launch_options = validate_cs2_launch_options(cs2_launch_options)
+    cs2_settings_source = validate_cs2_settings_source(cs2_settings_source)
+    from cs2_settings import ensure_cs2_closed, source_for_login, prepare_settings
     installation = _find_installation()
     local_base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
     paths = [installation / "config" / "config.vdf", installation / "config" / "loginusers.vdf", local_base / "Steam" / "local.vdf"]
     account_dir = installation / "userdata" / str(int(payload["sub"]) & 0xffffffff)
-    preference_merges = []
-    if private_login or cs2_launch_options is not None:
-        def merge_local_preferences(data):
-            if private_login:
-                data = merge_private_login(data, payload["sub"])
-            if cs2_launch_options is not None:
-                data = merge_cs2_launch_options(data, cs2_launch_options)
-            return data
-        preference_merges.append((account_dir / "config" / "localconfig.vdf",
-                                  merge_local_preferences))
-    if disable_cloud_sync:
-        preference_merges.append((account_dir / "7" / "remote" / "sharedconfig.vdf", merge_disable_cloud_sync))
-        # Older clients also keep a local roaming-config copy. Update it when
-        # present so it cannot reintroduce an enabled setting on startup.
-        legacy = account_dir / "config" / "sharedconfig.vdf"
-        if legacy.exists():
-            preference_merges.append((legacy, merge_disable_cloud_sync))
-    paths.extend(path for path, merge in preference_merges)
     with config_lock(paths[0]):
         progress("Preparing Steam login…")
         encrypted = encrypt_with_dpapi(token, account_name)
+        source_id = source_for_login(installation, cs2_settings_source, read_config(paths[1]).data)
+        if source_id is not None:
+            ensure_cs2_closed()
+            prepare_settings(installation, source_id, payload["sub"])
+            disable_cloud_sync = True
+        preference_merges = []
+        if private_login or cs2_launch_options is not None:
+            def merge_local_preferences(data):
+                if private_login:
+                    data = merge_private_login(data, payload["sub"])
+                if cs2_launch_options is not None:
+                    data = merge_cs2_launch_options(data, cs2_launch_options)
+                return data
+            preference_merges.append((account_dir / "config" / "localconfig.vdf", merge_local_preferences))
+        if disable_cloud_sync:
+            preference_merges.append((account_dir / "7" / "remote" / "sharedconfig.vdf", merge_disable_cloud_sync))
+            # Older clients also keep a local roaming-config copy. Update it
+            # when present so it cannot restore an enabled setting at startup.
+            legacy = account_dir / "config" / "sharedconfig.vdf"
+            if legacy.exists():
+                preference_merges.append((legacy, merge_disable_cloud_sync))
+        paths.extend(path for path, merge in preference_merges)
         for path in paths:
             read_config(path)  # Reject invalid files before closing the client.
         for path, merge in preference_merges:
@@ -723,6 +757,11 @@ def login_account(account_name, token, *, cancel=None, progress=None, private_lo
         progress("Closing Steam…")
         close_steam(installation, cancel)
         _check_cancel(cancel)
+        game_configs, source_checks = [], []
+        if source_id is not None:
+            ensure_cs2_closed()
+            # Steam can flush files during shutdown; use the latest bytes.
+            game_configs, source_checks = prepare_settings(installation, source_id, payload["sub"])
         configs = [read_config(path) for path in paths]
         validate_token(token)  # Recheck after waiting for shutdown.
         originals = [config.data for config in configs[:3]]
@@ -737,8 +776,12 @@ def login_account(account_name, token, *, cancel=None, progress=None, private_lo
             progress("Setting custom CS2 launch options…")
         for config, data in zip(configs, updated):
             config.data = data
+        if source_id is not None:
+            progress("Keeping CS2 video settings and keyboard/mouse controls…")
+            configs.extend(game_configs)
         progress("Saving account; keeping other remembered accounts…")
-        backups = write_configs(configs, cancel)
+        backups = (write_configs(configs, cancel, source_checks=source_checks) if source_checks
+                   else write_configs(configs, cancel))
         def check_after_save():
             if cancel is not None and cancel.is_set():
                 raise LoginCancelled("Cancelled after configuration was saved. Steam was not launched.")
@@ -763,4 +806,8 @@ def login_account(account_name, token, *, cancel=None, progress=None, private_lo
                 "preserved_accounts": sum(user_id != payload["sub"] for user_id in users), "warning": warning,
                 "sign_in": sign_in, "reason": reason, "private_login": bool(private_login),
                 "disable_cloud_sync": bool(disable_cloud_sync),
-                "cs2_launch_options_applied": cs2_launch_options is not None}
+                "cs2_launch_options_applied": cs2_launch_options is not None,
+                "cs2_settings_applied": source_id is not None,
+                "cs2_settings_copied": len(game_configs),
+                "cs2_settings_state": ("unavailable" if source_id is None else "same_account" if source_id == payload["sub"]
+                                       else "copied" if game_configs else "unchanged")}

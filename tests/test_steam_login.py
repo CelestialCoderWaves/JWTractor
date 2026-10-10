@@ -388,6 +388,8 @@ def test_normal_steam_shutdown_never_force_kills(monkeypatch):
 
 @pytest.fixture
 def workflow(tmp_path, monkeypatch):
+    import cs2_settings
+    monkeypatch.setattr(cs2_settings, "current_steam_session", lambda: None)
     monkeypatch.setattr(sl, "IS_WINDOWS", True)
     installation = tmp_path / "Steam"
     (installation / "config").mkdir(parents=True)

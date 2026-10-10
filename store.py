@@ -22,7 +22,7 @@ import time
 import tempfile
 
 from extractor import DEFAULT_SEPARATOR, ExtractionError, decode_token
-from steam_login import SteamLoginError, validate_cs2_launch_options
+from steam_login import SteamLoginError, validate_cs2_launch_options, validate_cs2_settings_source
 
 __all__ = [
     "Store",
@@ -88,7 +88,8 @@ class Store:
     def __init__(self, path: str | None = None):
         self.path = path or default_store_path()
         self.preferences = {"private_login": False, "disable_cloud_sync": True,
-                            "use_cs2_launch_options": False, "cs2_launch_options": ""}
+                            "use_cs2_launch_options": False, "cs2_launch_options": "",
+                            "cs2_settings_source": ""}
         self.cooldowns = {}
         self.selected_account_id = None
         self.load_error = None
@@ -118,11 +119,19 @@ class Store:
                     data["preferences"].get("cs2_launch_options"))
             except SteamLoginError:
                 self.preferences["use_cs2_launch_options"] = False
+            try:
+                self.preferences["cs2_settings_source"] = validate_cs2_settings_source(
+                    data["preferences"].get("cs2_settings_source", ""))
+            except SteamLoginError:
+                self.preferences["cs2_settings_source"] = ""
         accounts = data.get("accounts") if isinstance(data, dict) else None
         if not isinstance(accounts, list):
             return []
         accounts = [dict(a) for a in accounts]
         for account in accounts:
+            # Older versions offered a toggle. It can no longer disable copying.
+            if isinstance(account.get("preferences"), dict):
+                account["preferences"].pop("keep_cs2_settings", None)
             account.setdefault("id", _account_id(account["token"]))
             account.setdefault("alias", "")
             account.setdefault("last_used", 0)
@@ -173,11 +182,13 @@ class Store:
 
     @staticmethod
     def _validate_preferences(values):
-        if not isinstance(values, dict) or set(values) - {"private_login", "disable_cloud_sync", "use_cs2_launch_options", "cs2_launch_options"}:
+        if not isinstance(values, dict) or set(values) - {"private_login", "disable_cloud_sync", "use_cs2_launch_options", "cs2_launch_options", "keep_cs2_settings", "cs2_settings_source"}:
             raise ValueError("Invalid account settings.")
         for name, value in values.items():
             if name == "cs2_launch_options":
                 validate_cs2_launch_options(value)
+            elif name == "cs2_settings_source":
+                validate_cs2_settings_source(value)
             elif type(value) is not bool:
                 raise ValueError("Invalid account setting value.")
 
@@ -237,7 +248,8 @@ class Store:
                 os.fsync(handle.fileno())
         self._atomic_bytes(self.path, content)
         self.preferences = {"private_login": False, "disable_cloud_sync": True,
-                            "use_cs2_launch_options": False, "cs2_launch_options": ""}
+                            "use_cs2_launch_options": False, "cs2_launch_options": "",
+                            "cs2_settings_source": ""}
         self.cooldowns = {}
         self.selected_account_id = None
         self.load_error = None
@@ -250,6 +262,8 @@ class Store:
 
     def set_account_preferences(self, account_id, values):
         self._validate_preferences(values)
+        values = dict(values)
+        values.pop("keep_cs2_settings", None)
         account = self.get(account_id)
         if account is None:
             raise ValueError("Select a saved account first.")
@@ -325,6 +339,9 @@ class Store:
 
     def set_cs2_launch_options(self, options: str) -> None:
         self._set_preference("cs2_launch_options", validate_cs2_launch_options(options))
+
+    def set_cs2_settings_source(self, source: str) -> None:
+        self._set_preference("cs2_settings_source", validate_cs2_settings_source(source))
 
     def _set_preference(self, name: str, value) -> None:
         previous = self.preferences[name]

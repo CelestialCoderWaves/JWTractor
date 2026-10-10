@@ -27,6 +27,7 @@ from tkinter import filedialog, messagebox
 from datetime import datetime, timezone
 
 from cooldown import check_client_cooldown, current_steam_session
+from cs2_settings import list_settings_sources
 from diagnostics import Diagnostics
 from presence import fetch_presence
 
@@ -74,10 +75,10 @@ FG_FAINT = "#8490ad"    # readable labels / placeholder
 OK = "#4ade80"          # success
 ERR = "#f87171"         # error
 
-# Fixed content width; the window *height* is always sized to fit its content
-# (see App._fit_and_center) so nothing clips regardless of the platform's font
-# metrics. The cards likewise grow to fit their own content.
+# Start at a readable size; taller content grows the window up to the screen
+# limit, and manually resized windows keep their chosen dimensions.
 WIN_W = 600
+DEFAULT_H = 720
 PAD = 24                # equal outer margins
 GAP = 12                # shared spacing between controls and sections
 CONTENT_W = WIN_W - 2 * PAD
@@ -741,6 +742,7 @@ class App:
         self.private_login = self.store.preferences["private_login"]
         self.disable_cloud_sync = self.store.preferences["disable_cloud_sync"]
         self.use_cs2_launch_options = self.store.preferences["use_cs2_launch_options"]
+        self._cs2_source_names = {}
         self.current_account = None  # the saved account currently shown, if any
         self._picker = None  # the open account-picker popup, if any
         self._picker_closed_at = 0.0
@@ -1014,6 +1016,32 @@ class App:
         self.cs2_revert_btn.set_enabled(False)
         self.cs2_options_var.trace_add("write", self._cs2_draft_changed)
         self.cs2_options_card.fit()
+        self._section("CS2 VIDEO & CONTROLS", self.settings_content).pack(fill="x", padx=PAD, pady=GAP)
+        self.cs2_settings_card = RoundedCard(self.settings_content, self._content_width, fill=SURFACE,
+                                            border=BORDER, radius=20, inset=GAP)
+        self.cs2_settings_card.pack(padx=PAD)
+        row = tk.Frame(self.cs2_settings_card.inner, bg=SURFACE)
+        row.pack(fill="x")
+        tk.Label(row, text="Always keep CS2 video and controls", bg=SURFACE, fg=FG,
+                 font=("Segoe UI Semibold", 10), anchor="w", justify="left",
+                 wraplength=self._content_width - 2 * GAP).pack(fill="x")
+        tk.Label(self.cs2_settings_card.inner,
+                 text="Video settings, keybinds and mouse preferences are copied automatically at every login. Close CS2 before switching. Steam Cloud stays off when settings are copied.",
+                 bg=SURFACE, fg=FG_MUTED, font=("Segoe UI", 9), wraplength=self._content_width - 2 * GAP,
+                 anchor="w", justify="left").pack(fill="x", pady=(GAP, 0))
+        self.cs2_source_label = tk.Label(self.cs2_settings_card.inner, bg=SURFACE, fg=FG_MUTED,
+                                         font=("Segoe UI", 9), wraplength=self._content_width - 2 * GAP,
+                                         anchor="w", justify="left")
+        self.cs2_source_label.pack(fill="x", pady=(GAP, 0))
+        self.cs2_source_btn = RoundedButton(self.cs2_settings_card.inner, "Choose settings source",
+                                            self._choose_cs2_source, style="secondary", height=32, pad_x=GAP)
+        self.cs2_source_btn.pack(anchor="w", pady=(GAP, 0))
+        tk.Label(self.cs2_settings_card.inner,
+                 text="Automatic uses the previous Steam account. Choose a fixed source to always use your main account’s settings. Existing files are backed up before replacement.",
+                 bg=SURFACE, fg=FG_FAINT, font=("Segoe UI", 9), wraplength=self._content_width - 2 * GAP,
+                 anchor="w", justify="left").pack(fill="x", pady=(GAP, 0))
+        self._refresh_cs2_source_label()
+        self.cs2_settings_card.fit()
         self._section("SAVED DATA & DIAGNOSTICS", self.settings_content).pack(fill="x", padx=PAD, pady=GAP)
         self.data_card = RoundedCard(self.settings_content, self._content_width, fill=SURFACE, inset=GAP)
         self.data_card.pack(padx=PAD)
@@ -1054,6 +1082,7 @@ class App:
             setattr(self, name, values[name])
             getattr(self, name + "_btn").set_checked(values[name])
         self.cs2_options_var.set(values["cs2_launch_options"])
+        self._refresh_cs2_source_label()
         account = self.store.get(account_id)
         self.settings_scope_note.configure(text=f"Editing {account_label(account)}. Changes override this account’s defaults."
                                             if account else "Editing defaults. Accounts without custom settings inherit these options.")
@@ -1068,6 +1097,61 @@ class App:
             overrides = dict(account.get("preferences", {}))
             overrides[name] = value
             self.store.set_account_preferences(account["id"], overrides)
+
+    def _refresh_cs2_source_label(self):
+        source = self._settings_values()["cs2_settings_source"]
+        account = next((a for a in self.store.accounts if a.get("issuer") == "steam" and a.get("subject") == source), None)
+        if source and account is None and source not in self._cs2_source_names:
+            self._cs2_source_names.update({item["steam_id"]: item["name"] for item in list_settings_sources()})
+        label = account_label(account) if account else self._cs2_source_names.get(source, source)
+        self.cs2_source_label.configure(text="Source: " + (label if source else "Previous Steam account (automatic)"))
+
+    def _set_cs2_source(self, source):
+        if self._login_thread is not None or self._extraction is not None:
+            return
+        self._dismiss_import_report()
+        try:
+            self._save_setting("cs2_settings_source", source, self.store.set_cs2_settings_source)
+        except (OSError, SteamLoginError):
+            self._set_status("Could not save the CS2 settings source. Saved settings are unchanged.", ERR)
+        else:
+            self._refresh_cs2_source_label()
+            self._refresh_login_action()
+            self.cs2_settings_card.fit()
+            self._refit()
+
+    def _choose_cs2_source(self):
+        if self._login_thread is not None or self._extraction is not None:
+            return
+        previous = getattr(self, "_cs2_source_menu", None)
+        if previous is not None:
+            previous.destroy()
+        menu = tk.Menu(self.root, tearoff=False, bg=SURFACE, fg=FG, activebackground=ACCENT,
+                       activeforeground="white", font=("Segoe UI", 10))
+        self._cs2_source_menu = menu
+        menu.add_command(label="Previous Steam account (automatic)", command=lambda: self._set_cs2_source(""))
+        seen = set()
+        for account in self.store.ordered():
+            try:
+                claims = decode_token(account["token"])["payload"]
+                source = claims.get("sub") if claims.get("iss") == "steam" else None
+                if not isinstance(source, str) or not re.fullmatch(r"[0-9]{17}", source) or source in seen:
+                    continue
+            except (ExtractionError, AttributeError, KeyError):
+                continue
+            seen.add(source)
+            menu.add_command(label=account_label(account), command=lambda value=source: self._set_cs2_source(value))
+        sources = list_settings_sources()
+        self._cs2_source_names.update({item["steam_id"]: item["name"] for item in sources})
+        for item in sources:
+            source = item["steam_id"]
+            if source not in seen:
+                seen.add(source)
+                menu.add_command(label=item["name"] + " (Steam)", command=lambda value=source: self._set_cs2_source(value))
+        try:
+            menu.tk_popup(self.cs2_source_btn.winfo_rootx(), self.cs2_source_btn.winfo_rooty() + self.cs2_source_btn.winfo_height())
+        finally:
+            menu.grab_release()
 
     def _reset_profile(self):
         if self._settings_account_id and self._login_thread is None and self._extraction is None:
@@ -1837,6 +1921,7 @@ class App:
         self.private_login_btn.set_enabled(not busy and os.name == "nt")
         self.disable_cloud_sync_btn.set_enabled(not busy and os.name == "nt")
         self.use_cs2_launch_options_btn.set_enabled(not busy and os.name == "nt")
+        self.cs2_source_btn.set_enabled(not busy and os.name == "nt")
         self.cs2_launch_options_entry.configure(state="disabled" if busy else "normal")
         self.cs2_revert_btn.set_enabled(not busy and self.cs2_options_var.get() != self._settings_values()["cs2_launch_options"])
         self.defaults_scope_btn.set_enabled(not busy)
@@ -1866,6 +1951,7 @@ class App:
                 options.extend(("Friends offline", "Remote Play off"))
             if effective["use_cs2_launch_options"]:
                 options.append("Custom CS2 options" if effective["cs2_launch_options"] else "Clear CS2 options")
+            options.append("Keep CS2 video & controls")
             self.login_summary.configure(text="Next login: " + (" · ".join(options) if options else "Steam’s current settings"))
             self.login_summary.pack(before=self.actions, fill="x", pady=(0, GAP))
         else:
@@ -1915,18 +2001,21 @@ class App:
         effective = self.store.effective_preferences(account["id"])
         cs2_options = effective["cs2_launch_options"] if effective["use_cs2_launch_options"] else None
         self._login_thread = threading.Thread(target=self._login_worker,
-                                              args=(account, effective["private_login"], effective["disable_cloud_sync"], cs2_options), name="Steam login")
+                                              args=(account, effective["private_login"], effective["disable_cloud_sync"], cs2_options,
+                                                    effective["cs2_settings_source"]), name="Steam login")
         self._refresh_login_action()
         self._set_status("Preparing Steam login…")
         self._login_thread.start()
         self._login_poll_job = self.root.after(80, self._drain_login_events)
 
-    def _login_worker(self, account, private_login=False, disable_cloud_sync=False, cs2_launch_options=None):
+    def _login_worker(self, account, private_login=False, disable_cloud_sync=False, cs2_launch_options=None,
+                      cs2_settings_source=""):
         try:
+            settings = {"cs2_settings_source": cs2_settings_source} if cs2_settings_source else {}
             result = login_account(account["username"], account["token"], cancel=self._login_cancel,
                                    progress=lambda message: self._login_events.put(("progress", message)),
                                    private_login=private_login, disable_cloud_sync=disable_cloud_sync,
-                                   cs2_launch_options=cs2_launch_options)
+                                   cs2_launch_options=cs2_launch_options, **settings)
             self._login_events.put(("done", result))
         except LoginCancelled as exc:
             self.diagnostics.record("login.cancelled", exc)
@@ -1961,6 +2050,14 @@ class App:
                 cloud = " Steam Cloud Sync off configured." if value.get("disable_cloud_sync") else ""
                 if value.get("cs2_launch_options_applied"):
                     cloud += " CS2 launch options configured."
+                if value.get("cs2_settings_applied"):
+                    if value.get("cs2_settings_state") == "same_account":
+                        cloud += " CS2 source is this account; no settings copied. Choose another source to transfer settings."
+                    else:
+                        cloud += (" CS2 video and controls copied." if value.get("cs2_settings_copied")
+                                  else " CS2 video and controls already match the source.")
+                elif value.get("cs2_settings_state") == "unavailable":
+                    cloud += " No previous CS2 settings available to copy."
                 if sign_in == "rejected":
                     self._set_status(f"Steam rejected sign-in: {value.get('reason') or 'Login rejected'}. Check the session with the account owner.", ERR)
                 elif sign_in == "other_account":
@@ -2462,7 +2559,9 @@ class App:
         self._refit()
         self.root.update_idletasks()
         w = WIN_W
-        h = self.root.winfo_height()
+        # A withdrawn window can still report its old minimum height until it
+        # is mapped. Center the requested size, rather than restoring that height.
+        h = self._auto_geometry[1] if self._auto_geometry else self.root.winfo_height()
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
         x = (sw - w) // 2
@@ -2473,23 +2572,32 @@ class App:
         """Resize the window to its content's height, keeping its position."""
         if self._layout_running:
             return
-        self.root.update_idletasks()
-        page = self._pages[self.active_tab]
-        content_height = page.winfo_reqheight() + (PAD if not self.footer.winfo_manager() else 0)
-        width = self._content_width + 2 * PAD
-        self.viewport.configure(height=content_height, scrollregion=(0, 0, width, content_height))
-        self.root.update_idletasks()
-        if self._manual_size is not None:
-            return
-        h = min(self.root.winfo_reqheight(), self.root.winfo_screenheight() - 120)
-        y = max(0, min(self.root.winfo_y(), self.root.winfo_screenheight() - h - 80))
-        self._auto_geometry = (WIN_W, h)
-        self.root.geometry(f"{WIN_W}x{h}+{max(0, self.root.winfo_x())}+{y}")
+        # Geometry changes and idle layout passes can emit intermediate sizes.
+        # Process them under the guard so they never latch as a manual resize.
+        self._layout_running = True
+        try:
+            self.root.update_idletasks()
+            page = self._pages[self.active_tab]
+            content_height = page.winfo_reqheight() + (PAD if not self.footer.winfo_manager() else 0)
+            width = self._content_width + 2 * PAD
+            self.viewport.configure(height=content_height, scrollregion=(0, 0, width, content_height))
+            self.root.update_idletasks()
+            if self._manual_size is not None:
+                return
+            h = min(max(DEFAULT_H, self.root.winfo_reqheight()), self.root.winfo_screenheight() - 120)
+            y = max(0, min(self.root.winfo_y(), self.root.winfo_screenheight() - h - 80))
+            self._auto_geometry = (WIN_W, h)
+            self.root.geometry(f"{WIN_W}x{h}+{max(0, self.root.winfo_x())}+{y}")
+            self.root.update_idletasks()
+        finally:
+            self._layout_running = False
 
     def _on_root_resize(self, event):
         if event.widget is not self.root or self._layout_running:
             return
         size = (event.width, event.height)
+        if size != (self.root.winfo_width(), self.root.winfo_height()):
+            return  # Ignore queued events for a superseded programmatic size.
         if size == self._auto_geometry or event.width < 520:
             return
         self._manual_size = size
@@ -2526,7 +2634,7 @@ class App:
             self.steam_status.configure(wraplength=max(120, new_width - 124))
             self.drop.set_width(new_width)
             for card in (self.import_card, self.result_card, self.details_card, self.login_options_card,
-                         self.cs2_options_card, self.data_card):
+                         self.cs2_options_card, self.cs2_settings_card, self.data_card):
                 card.set_width(new_width)
             self.cs2_options_field.set_width(new_width - 2 * GAP)
             self.cs2_options_card.fit()

@@ -291,7 +291,8 @@ def test_cloud_preference_defaults_on_remembers_off_and_rolls_back_save_failure(
     assert store.preferences["disable_cloud_sync"] is True
     store.set_disable_cloud_sync(False)
     assert Store(str(path)).preferences == {"private_login": True, "disable_cloud_sync": False,
-                                           "use_cs2_launch_options": False, "cs2_launch_options": ""}
+                                           "use_cs2_launch_options": False, "cs2_launch_options": "",
+                                           "cs2_settings_source": ""}
     def fail():
         raise PermissionError("Synthetic save failure")
     monkeypatch.setattr(store, "save", fail)

@@ -36,6 +36,9 @@ effective options, including overrides. Settings stay in the upper-left corner.
 The window can be resized; cards, text, and buttons adapt to its width, while
 long content scrolls and the action buttons remain visible. Your chosen window
 size is retained when switching tabs during the session.
+It starts at 600 × 720 pixels where the screen allows, and grows automatically
+for taller views until you resize it yourself. Smaller screens keep scrolling
+within the available height.
 
 File imports run in the background. Browse for several executables, drop them
 together, or pass their paths to `app.py` to import a queue of up to 2,000 files.
@@ -73,6 +76,40 @@ These changes share the login backups and rollback and preserve other games
 and accounts. CS2 itself is not launched automatically. You can check the result
 in Steam's **CS2 → Properties → General → Launch Options**, as described in
 [Steam's launch-options guide](https://help.steampowered.com/en/faqs/view/7D01-D2DD-D75E-2955).
+
+JWTractor automatically carries video settings, keybinds, and mouse preferences
+into the account you log into. This is always on; there is no toggle to enable.
+Under **Settings → CS2 video & controls**, **Choose settings source** defaults to the previous Steam account
+(the active account, or Steam's most recently selected account when Steam is
+closed). Pick a saved account or a remembered Steam account with local CS2
+settings as a fixed source to always use your main account's settings. You
+do not need to import its token. Defaults and account overrides are saved locally.
+Each installation uses its own local Steam accounts and settings. A fixed source
+is a personal preference on that computer; account identities, saved tokens,
+and CS2 settings are not bundled with the distributed executable.
+Old disabled preferences are ignored. The **Next login** summary always shows
+that CS2 settings are kept. Selecting the same source and destination keeps that
+account's own settings and reports that no settings were copied.
+
+Close CS2 before switching accounts. JWTractor reads the source again after
+Steam closes, copies the local settings without reformatting them, and backs
+up existing destination files. With no previous CS2 settings, Steam can still
+log in; JWTractor reports that nothing was available to copy. Incomplete or
+unreadable settings, or an unavailable fixed source, stop the login with
+instructions to choose another source or run CS2 there first.
+The settings and Steam login files share one transaction: a failed or cancelled
+write restores the originals. Identical files are left alone. The source
+settings stay unchanged, and CS2 is not launched automatically.
+
+Only CS2 video and user/machine preference files under
+`userdata/<account-id>/730/local/cfg` are copied; scripts, other games, and
+Cloud snapshots are excluded. Valve's game logs show the
+[video configuration](https://github.com/ValveSoftware/csgo-osx-linux/issues/3727)
+and [user key/convar files](https://github.com/ValveSoftware/csgo-osx-linux/issues/4532).
+Steam Cloud Sync is disabled for the destination account when source settings are available,
+even if the separate Cloud toggle is off, to prevent remote settings replacing
+the copied ones. Live game verification is still pending;
+the copy and recovery workflow is tested using synthetic accounts and files.
 
 **Disable Steam Cloud Sync** under **Settings → Login options** is on by default to help
 with crashes when Cloud sync is enabled. JWTractor remembers this option and
@@ -125,6 +162,7 @@ running it:
 | [`app.py`](app.py) | The drag-and-drop GUI (tkinter), with a decoded-claims preview and saved accounts. |
 | [`store.py`](store.py) | Saves extracted tokens + your aliases to a local JSON file. No dependencies. |
 | [`steam_login.py`](steam_login.py) | Windows Steam login, DPAPI encryption, account preservation, backups and rollback. Uses the Python standard library. |
+| [`cs2_settings.py`](cs2_settings.py) | Copies CS2 video and controls between accounts with source checks and transaction backups. |
 | [`steam.py`](steam.py) | Steam installation detection and separate backup/restore helpers. |
 | [`extract.py`](extract.py) | A command-line version (batch, `--decode`, `--all`, `--token-only`, …). |
 | [`tests/test_extractor.py`](tests/test_extractor.py) | Core tests, using a **synthetic** token (no real data). |

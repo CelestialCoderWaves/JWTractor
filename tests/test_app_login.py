@@ -28,6 +28,7 @@ def tk_root():
 def window(tmp_path, monkeypatch, tk_root):
     monkeypatch.setenv("JWTRACTOR_STORE", str(tmp_path / "accounts.json"))
     monkeypatch.setattr(gui, "current_steam_session", lambda: None)
+    monkeypatch.setattr(gui, "list_settings_sources", lambda: [])
     monkeypatch.setattr(gui, "fetch_presence", lambda *a, **k: {"state": "unknown", "message": "Synthetic presence unavailable"})
     root = tk.Toplevel(tk_root)
     root.withdraw()
@@ -188,6 +189,97 @@ def test_cloud_toggle_save_failure_keeps_default_enabled(window, monkeypatch):
     assert window.disable_cloud_sync_btn.checked
     assert window.store.preferences["disable_cloud_sync"]
     assert "Could not save" in window.status.cget("text")
+
+
+def test_cs2_settings_source_menu_and_scoped_preferences(window, monkeypatch):
+    alice = window.store.add(jwt(), "alice")
+    window.store.set_alias(alice["id"], "Main account")
+    bob = window.store.add(jwt({"sub": "76561198000000001"}), "bob")
+    window._use_account(bob)
+    assert not hasattr(window, "keep_cs2_settings_btn")
+    assert "Keep CS2 video & controls" in window.login_summary.cget("text")
+    monkeypatch.setattr(tk.Menu, "tk_popup", lambda *args: None)
+    window._choose_cs2_source()
+    menu = window._cs2_source_menu
+    source_index = next(index for index in range(menu.index("end") + 1)
+                        if menu.entrycget(index, "label") == "Main account")
+    menu.invoke(source_index)
+    assert window.store.preferences["cs2_settings_source"] == alice["subject"]
+    assert window.cs2_source_label.cget("text") == "Source: Main account"
+    window._change_settings_scope(bob["id"])
+    window._set_cs2_source("")
+    assert window.store.effective_preferences(bob["id"])["cs2_settings_source"] == ""
+    assert window.store.preferences["cs2_settings_source"] == alice["subject"]
+    window._reset_profile()
+    assert window.cs2_source_label.cget("text") == "Source: Main account"
+    loaded = gui.Store(window.store.path)
+    assert loaded.preferences["cs2_settings_source"] == alice["subject"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Steam login button is Windows-only")
+def test_cs2_copy_source_reaches_worker_and_controls_lock_during_login(window, monkeypatch):
+    account = window.store.add(jwt(), "alice")
+    window._use_account(account)
+    window._toggle_disable_cloud_sync()
+    window._set_cs2_source("76561198000000001")
+    assert "Keep CS2 video & controls" in window.login_summary.cget("text")
+    entered, release = threading.Event(), threading.Event()
+    received = []
+    def login(*args, **kwargs):
+        received.append(kwargs)
+        entered.set()
+        assert release.wait(2)
+        return {"preserved_accounts": 1, "sign_in": "unconfirmed", "disable_cloud_sync": True,
+                "cs2_settings_applied": True, "cs2_settings_copied": 3}
+    monkeypatch.setattr(gui, "login_account", login)
+    window._login_to_steam()
+    try:
+        wait_until_entered(window, entered)
+        assert not window.cs2_source_btn._enabled
+        window._set_cs2_source("")
+        assert window.store.preferences["cs2_settings_source"] == "76561198000000001"
+    finally:
+        release.set()
+    finish(window)
+    assert "keep_cs2_settings" not in received[0]
+    assert received[0]["cs2_settings_source"] == "76561198000000001"
+    assert "CS2 video and controls copied" in window.status.cget("text")
+    assert window.cs2_source_btn._enabled
+
+
+def test_cs2_source_save_failure_keeps_previous_selection(window, monkeypatch):
+    window._set_cs2_source("76561198000000001")
+    def fail():
+        raise PermissionError("Synthetic save failure")
+    monkeypatch.setattr(window.store, "save", fail)
+    window._set_cs2_source("")
+    assert window.store.preferences["cs2_settings_source"] == "76561198000000001"
+    assert window.cs2_source_label.cget("text") == "Source: 76561198000000001"
+    assert "Could not save" in window.status.cget("text")
+
+
+def test_source_picker_offers_remembered_steam_account_without_importing_token(window, monkeypatch):
+    source = "76561198000000001"
+    monkeypatch.setattr(gui, "list_settings_sources", lambda: [{"steam_id": source, "name": "synthetic_main"}])
+    monkeypatch.setattr(tk.Menu, "tk_popup", lambda *args: None)
+    window._choose_cs2_source()
+    menu = window._cs2_source_menu
+    assert menu.entrycget(1, "label") == "synthetic_main (Steam)"
+    menu.invoke(1)
+    assert window.store.preferences["cs2_settings_source"] == source
+    assert window.cs2_source_label.cget("text") == "Source: synthetic_main"
+    assert window.store.accounts == []
+
+
+def test_same_account_copy_result_does_not_claim_settings_match_another_account(window):
+    window._login_events.put(("done", {"sign_in": "unconfirmed", "preserved_accounts": 1,
+                                       "cs2_settings_applied": True, "cs2_settings_copied": 0,
+                                       "cs2_settings_state": "same_account"}))
+    window._drain_login_events()
+    text = window.status.cget("text")
+    assert "no settings copied" in text
+    assert "Choose another source" in text
+    assert "already match" not in text
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Steam login button is Windows-only")
@@ -928,7 +1020,7 @@ def test_cancellation_stays_disabled_after_switching_tabs(window, monkeypatch):
 
 def test_search_survives_rename_and_login_summary_tracks_options(window):
     account = window._add_token("alice----" + jwt())
-    assert window.login_summary.cget("text") == "Next login: Cloud off"
+    assert window.login_summary.cget("text") == "Next login: Cloud off · Keep CS2 video & controls"
     window._toggle_private_login()
     assert "Friends offline · Remote Play off" in window.login_summary.cget("text")
     window._open_picker()
@@ -979,6 +1071,10 @@ def test_settings_labels_fit_inside_cards_at_multiple_font_scales(window, scalin
             assert text.winfo_x() + text.winfo_width() <= switch.winfo_x()
             for label in text.winfo_children():
                 assert label.winfo_width() <= text.winfo_width()
+        row = application.cs2_settings_card.inner.winfo_children()[0]
+        title = row.winfo_children()[0]
+        assert len(row.winfo_children()) == 1
+        assert title.winfo_width() <= row.winfo_width()
         assert root.winfo_reqwidth() <= gui.WIN_W
     finally:
         root.destroy()
@@ -1165,6 +1261,34 @@ def test_manual_resize_reflows_cards_and_keeps_actions_visible(window, width):
     window.root.update()
     assert window.root.winfo_width() == width and window.root.winfo_height() == 650
     assert window.viewport.yview()[1] < 1
+
+
+def test_startup_and_settings_size_automatically_without_latching_a_manual_resize(window):
+    window.root.deiconify()
+    window.root.update()
+    assert window._manual_size is None
+    assert window.root.winfo_height() >= min(gui.DEFAULT_H, window.root.winfo_screenheight() - 120)
+    window._add_token("alice----" + jwt())
+    window.root.update()
+    window._select_tab("settings")
+    window.root.update()
+    expected = min(max(gui.DEFAULT_H, window.root.winfo_reqheight()), window.root.winfo_screenheight() - 120)
+    assert window._manual_size is None
+    assert window.root.winfo_height() == expected
+    window._select_tab("accounts")
+    window.root.update()
+    assert window._manual_size is None
+
+
+def test_stale_programmatic_size_event_does_not_disable_automatic_sizing(window):
+    from types import SimpleNamespace
+    window.root.update()
+    window._on_root_resize(SimpleNamespace(widget=window.root, width=gui.WIN_W, height=420))
+    assert window._manual_size is None
+    window._select_tab("settings")
+    window.root.update()
+    assert window._manual_size is None
+    assert window.root.winfo_height() > 420
 
 
 def test_new_claims_fit_after_resizing_to_minimum_width(window):
